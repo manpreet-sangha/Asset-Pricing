@@ -1,0 +1,152 @@
+# ASTRX Index Analysis
+# SMM265 Asset Pricing - Question 2
+# Author: [201148348 - Manpreet Sangha]
+# Date: November 30, 2025
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import datetime
+import os
+
+def load_and_clean_data():
+    """
+    Load and clean the ASTRX index data from Excel file
+    """
+    # File path
+    file_path = r"C:\Users\Manpreet\OneDrive - City St George's, University of London\Documents\Term1\Coursework\SMM265 Asset Pricing\Q1\Data\Raw Data\Monthly\SMM265 - ASTRX - FTSE All Share Index - Monthly.xlsx"
+    
+    try:
+        # Check if file exists
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"File not found: {file_path}")
+        
+        # Load the Excel file
+        print("Loading ASTRX Index Excel file...")
+        df = pd.read_excel(file_path)
+        
+        # Display basic info about the dataset
+        print(f"Original dataset shape: {df.shape}")
+        print("\nColumn names:")
+        print(df.columns.tolist())
+        print("\nFirst few rows:")
+        print(df.head())
+        
+        # Basic data cleaning steps
+        print("\n" + "="*50)
+        print("CLEANING ASTRX INDEX DATA")
+        print("="*50)
+        
+        # Remove first six rows
+        df_cleaned = df.iloc[6:].copy()
+        print(f"After removing first 6 rows: {df_cleaned.shape}")
+        
+        # Remove completely empty rows and columns
+        df_cleaned = df_cleaned.dropna(how='all').dropna(axis=1, how='all')
+        print(f"After removing empty rows/columns: {df_cleaned.shape}")
+        
+        # Remove px_bid column if it exists
+        if 'px_bid' in df_cleaned.columns:
+            df_cleaned = df_cleaned.drop('px_bid', axis=1)
+            print(f"Removed px_bid column. New shape: {df_cleaned.shape}")
+        elif any('bid' in col.lower() for col in df_cleaned.columns):
+            # Find and remove any column containing 'bid'
+            bid_cols = [col for col in df_cleaned.columns if 'bid' in col.lower()]
+            df_cleaned = df_cleaned.drop(bid_cols, axis=1)
+            print(f"Removed bid column(s): {bid_cols}. New shape: {df_cleaned.shape}")
+        
+        # Reset index after removing rows
+        df_cleaned = df_cleaned.reset_index(drop=True)
+        print(f"Index reset. Final shape: {df_cleaned.shape}")
+        
+        # Rename columns to 'date' and 'astrx_index'
+        if len(df_cleaned.columns) >= 2:
+            df_cleaned.columns = ['date', 'astrx_index']
+            print(f"Columns renamed to: {list(df_cleaned.columns)}")
+        else:
+            print(f"Warning: Expected at least 2 columns, found {len(df_cleaned.columns)}")
+        
+        # Convert date column to datetime and remove timestamp
+        if 'date' in df_cleaned.columns:
+            try:
+                df_cleaned['date'] = pd.to_datetime(df_cleaned['date']).dt.date
+                print("Date column converted to date format (no timestamp)")
+            except Exception as e:
+                print(f"Warning: Could not convert date column: {e}")
+        
+        # Sort by date in ascending order
+        if 'date' in df_cleaned.columns:
+            try:
+                df_cleaned = df_cleaned.sort_values('date', ascending=True).reset_index(drop=True)
+                print("Data sorted by date in ascending order")
+            except Exception as e:
+                print(f"Warning: Could not sort by date: {e}")
+        
+        # Display cleaned data info
+        print("\nCleaned dataset info:")
+        print(df_cleaned.info())
+        print("\nData types:")
+        print(df_cleaned.dtypes)
+        
+        # Show first few rows of cleaned data
+        print("\nFirst few rows of cleaned data:")
+        print(df_cleaned.head())
+        
+        # Check for missing values
+        missing_values = df_cleaned.isnull().sum()
+        if missing_values.sum() > 0:
+            print(f"\nMissing values found:")
+            print(missing_values[missing_values > 0])
+        else:
+            print("\nNo missing values found.")
+        
+        return df_cleaned
+        
+    except Exception as e:
+        print(f"Error loading/cleaning ASTRX index data: {e}")
+        return None
+
+def save_cleaned_data(df, output_path=None):
+    """
+    Save cleaned ASTRX index data to Excel file
+    """
+    if df is None:
+        print("No data to save.")
+        return
+    
+    if output_path is None:
+        # Create output directory if it doesn't exist
+        output_dir = r"C:\Users\Manpreet\OneDrive - City St George's, University of London\Documents\Term1\Coursework\SMM265 Asset Pricing\Q1\Data\Cleaned Data\Monthly"
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, "SMM265 - ASTRX - FTSE All Share Index - Monthly.xlsx")
+    
+    try:
+        df.to_excel(output_path, index=False)
+        print(f"\nCleaned ASTRX index data saved to: {output_path}")
+    except Exception as e:
+        print(f"Error saving ASTRX index data: {e}")
+
+def main():
+    """
+    Main function for ASTRX index analysis
+    """
+    print("ASTRX Index Analysis")
+    print("=" * 40)
+    
+    # Load and clean the data
+    cleaned_data = load_and_clean_data()
+    
+    if cleaned_data is not None:
+        # Save cleaned data
+        save_cleaned_data(cleaned_data)
+        
+        # Display summary statistics
+        print("\n" + "="*50)
+        print("SUMMARY STATISTICS")
+        print("="*50)
+        print(cleaned_data.describe())
+    else:
+        print("Data cleaning failed. Please check the file path and format.")
+
+if __name__ == "__main__":
+    main()
