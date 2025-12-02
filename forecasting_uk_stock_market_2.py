@@ -76,7 +76,7 @@ class PesaranTimmermannMultiPredictor:
         interbank_file = BASE_PATH / "Data" / "Cleaned Data" / "Monthly" / "SMM265_UK_InterBank_Rate_Monthly.xlsx"
         
         # Load UK CPI data
-        cpi_file = BASE_PATH / "Data" / "Cleaned Data" / "Monthly" / "SMM265_UK_CPI_Monthly.xlsx"
+        cpi_file = BASE_PATH / "Data" / "Cleaned Data" / "Monthly" / "SMM265 - UKRPCJYR Index - UK CPI YoY - Monthly.xlsx"
         
         try:
             # Load the index and dividend yield data
@@ -127,27 +127,51 @@ class PesaranTimmermannMultiPredictor:
                     # Assume second column is the rate if first is date
                     interbank_data = interbank_data.rename(columns={interbank_data.columns[1]: 'interbank_rate'})
             
-            # Convert dates to datetime - using lowercase 'date' for both
+            # Ensure CPI data has correct column names
+            if 'cpi_yoy' not in cpi_data.columns:
+                # Try common column names for CPI
+                cpi_columns = [col for col in cpi_data.columns if 'cpi' in col.lower() or 'inflation' in col.lower()]
+                if cpi_columns:
+                    cpi_data = cpi_data.rename(columns={cpi_columns[0]: 'cpi_yoy'})
+                elif len(cpi_data.columns) >= 2:
+                    # Assume second column is the CPI if first is date
+                    cpi_data = cpi_data.rename(columns={cpi_data.columns[1]: 'cpi_yoy'})
+            
+            # Convert dates to datetime - using lowercase 'date' for all
             index_data['date'] = pd.to_datetime(index_data['date'])
             interbank_data['date'] = pd.to_datetime(interbank_data['date'])
+            cpi_data['date'] = pd.to_datetime(cpi_data['date'])
             
             # Create year-month columns for matching (CCYY-MM format)
             index_data['year_month'] = index_data['date'].dt.to_period('M')
             interbank_data['year_month'] = interbank_data['date'].dt.to_period('M')
+            cpi_data['year_month'] = cpi_data['date'].dt.to_period('M')
             
             print(f"   🔍 Index date range: {index_data['year_month'].min()} to {index_data['year_month'].max()}")
             print(f"   🔍 InterBank date range: {interbank_data['year_month'].min()} to {interbank_data['year_month'].max()}")
+            print(f"   🔍 CPI date range: {cpi_data['year_month'].min()} to {cpi_data['year_month'].max()}")
             
-            # Find common year-months
-            common_months = set(index_data['year_month']) & set(interbank_data['year_month'])
-            print(f"   🔍 Common year-months: {len(common_months)}")
+            # Find common year-months across all three datasets
+            common_months_step1 = set(index_data['year_month']) & set(interbank_data['year_month'])
+            common_months_all = common_months_step1 & set(cpi_data['year_month'])
+            print(f"   🔍 Common year-months (Index + InterBank): {len(common_months_step1)}")
+            print(f"   🔍 Common year-months (All three datasets): {len(common_months_all)}")
             
-            # Merge on year-month, keeping the original date from index file
-            self.data = pd.merge(
+            # First merge: Index + InterBank
+            temp_merged = pd.merge(
                 index_data, 
                 interbank_data[['year_month', 'interbank_rate']],
                 left_on='year_month', 
                 right_on='year_month',
+                how='inner'
+            )
+            
+            # Second merge: Add CPI data to get the complete multi-predictor dataset
+            self.data = pd.merge(
+                temp_merged,
+                cpi_data[['year_month', 'cpi_yoy']],
+                left_on='year_month',
+                right_on='year_month', 
                 how='inner'
             )
             
@@ -166,16 +190,16 @@ class PesaranTimmermannMultiPredictor:
             # Save merged data for verification
             output_dir = BASE_PATH / "Data" / "Output"
             output_dir.mkdir(parents=True, exist_ok=True)
-            output_file = output_dir / "SMM265_Index_DivYield_InterBank_Monthly_Merged.xlsx"
+            output_file = output_dir / "SMM265_PT_Model_DivYield_CPI_Merged_Data.xlsx"
             
             with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
                 self.data.to_excel(writer, sheet_name='Data', index=False)
             
             print(f"   💾 Merged data saved to: {output_file.name}")
-            print(f"   ✅ Loaded dataset: {len(self.data)} observations")
+            print(f"   ✅ Multi-predictor dataset: {len(self.data)} observations")
             print(f"   📅 Period: {self.data['Date'].min().strftime('%Y-%m')} to {self.data['Date'].max().strftime('%Y-%m')}")
             print(f"   📊 Columns: {list(self.data.columns)}")
-            print(f"   📈 Using UK InterBank Rate")
+            print(f"   📈 Predictors: Dividend Yield + UK CPI YoY + UK InterBank Rate")
             
             # Debug: Show first and last few dates
             print(f"   🔍 First 5 dates: {self.data['Date'].head().dt.strftime('%Y-%m-%d').tolist()}")
@@ -194,79 +218,28 @@ class PesaranTimmermannMultiPredictor:
             return False
     
     def compute_returns(self):
-        """Compute 6-month returns and excess returns for training data only"""
-        print("📈 Computing 6-month returns and excess returns...")
-        print("   🎯 Computing returns ONLY for initial training period")
-        print("   📅 Training period: Apr 1997 - Sep 2015")
-        print("   📅 Need 6m ahead data until Mar 2016 to compute training returns")
+        """Prepare data structure for rolling window - returns computed dynamically for each window"""
+        print("📈 Preparing data for rolling window predictions...")
+        print("   🎯 Returns will be computed dynamically for each expanding window:")
+        print("      • 1st prediction (Oct 2015): Training Apr 1997 - Sep 2015 (~222 obs)")
+        print("      • 2nd prediction (Apr 2016): Training Apr 1997 - Mar 2016 (~228 obs)")
+        print("      • 3rd prediction (Oct 2016): Training Apr 1997 - Sep 2016 (~234 obs)")
+        print("      • Each window expands by 6 months of new data")
         
         df = self.data.copy()
         
-        # Define the cutoff for training data - we need historical data until Mar 2016 to compute
-        # realized 6-month returns for observations up to Sep 2015
-        training_end = pd.to_datetime('2015-09-30')
-        data_needed_until = pd.to_datetime('2016-03-31')  # Need historical data 6 months past training end
+        # Sort by date to ensure proper chronological order
+        df = df.sort_values('Date').reset_index(drop=True)
         
-        # Find observations that can be used for training
-        # (observations from Apr 1997 to Sep 2015 where we can calculate realized returns)
-        training_start = pd.to_datetime('1997-04-30')
+        print(f"   ✅ Data prepared for rolling window analysis")
+        print(f"   📊 Total available observations: {len(df)}")
+        print(f"   � Data range: {df['Date'].min().strftime('%Y-%m-%d')} to {df['Date'].max().strftime('%Y-%m-%d')}")
+        print(f"   � Predictors available: Dividend Yield + CPI Growth + InterBank Rate")
+        print(f"   � Returns and excess returns will be computed for each training window")
         
-        # Filter data to only include training period where we can compute 6m returns
-        training_mask = (df['Date'] >= training_start) & (df['Date'] <= training_end)
-        training_indices = df[training_mask].index.tolist()
-        
-        print(f"   📊 Training observations (Apr 1997 - Sep 2015): {len(training_indices)}")
-        
-        # Only compute returns for training observations where we have historical data
-        # to calculate their realized 6-month returns (need stock prices 6 months later)
-        valid_training_indices = []
-        for idx in training_indices:
-            # Check if we have historical stock price data 6 months later to compute realized returns
-            if idx + 6 < len(df):
-                future_date = df.iloc[idx + 6]['Date']
-                if future_date <= data_needed_until:
-                    valid_training_indices.append(idx)
-        
-        print(f"   📊 Valid training observations with historical data for return calculation: {len(valid_training_indices)}")
-        
-        # Initialize return columns
-        df['ftse_6m_return'] = np.nan
-        df['m_interbank_6m_return'] = np.nan
-        df['excess_return'] = np.nan
-        
-        # Compute 6-month stock returns only for valid training indices
-        for idx in valid_training_indices:
-            if idx + 6 < len(df):
-                df.iloc[idx, df.columns.get_loc('ftse_6m_return')] = (
-                    df.iloc[idx + 6]['ftse_price'] / df.iloc[idx]['ftse_price'] - 1
-                )
-        
-        # Compute 6-month InterBank returns using current period rates
-        # This calculates the expected 6m return if investing at current InterBank rate
-        df['m_interbank_6m_return'] = (1 + df['m_interbank_rate']/100)**(0.5) - 1
-        
-        print(df['m_interbank_6m_return'])
-
-        # Compute excess returns only where we have stock returns
-        mask = ~df['ftse_6m_return'].isna()
-        df.loc[mask, 'excess_return'] = (
-            df.loc[mask, 'ftse_6m_return'] - df.loc[mask, 'm_interbank_6m_return']
-        )
-        
-        # Keep only observations with valid excess returns for training
-        df_training = df[~df['excess_return'].isna()].copy().reset_index(drop=True)
-        
-        print(f"   ✅ Computed returns for {len(df_training)} training observations")
-        
-        if len(df_training) > 0:
-            print(f"   📊 Average 6m stock return: {df_training['ftse_6m_return'].mean()*100:.2f}%")
-            print(f"   📊 Average 6m InterBank return: {df_training['m_interbank_6m_return'].mean()*100:.2f}%")
-            print(f"   📊 Average excess return: {df_training['excess_return'].mean()*100:.2f}%")
-            print(f"   📅 Training period: {df_training['Date'].min().strftime('%Y-%m-%d')} to {df_training['Date'].max().strftime('%Y-%m-%d')}")
-        
-        # Store both full data (for rolling window) and training data
+        # Store the full dataset for rolling window use
         self.full_data = df  # Keep full data for rolling window
-        self.data = df_training  # Use training data for initial model
+        self.data = df
 
     def prepare_initial_training_data(self):
         """Prepare initial training data for reference (ROLLING WINDOW USES EXPANDING WINDOWS)"""
@@ -283,8 +256,6 @@ class PesaranTimmermannMultiPredictor:
             print(f"   📊 Total observations: {len(self.data)}")
             data_source = self.data
         
-        print(f"   📊 Training data with returns: {self.data['Date'].min().strftime('%Y-%m-%d')} to {self.data['Date'].max().strftime('%Y-%m-%d')} ({len(self.data)} obs)")
-        
         # Convert date strings to datetime
         training_start = pd.to_datetime(self.training_start)
         training_end = pd.to_datetime(self.training_end)
@@ -294,9 +265,26 @@ class PesaranTimmermannMultiPredictor:
         print(f"   🎯 Initial training period: {training_start.strftime('%Y-%m-%d')} to {training_end.strftime('%Y-%m-%d')}")
         print(f"   🎯 Rolling prediction starts: {prediction_start.strftime('%Y-%m-%d')}")
         
-        # Training period: Apr 1997 → Sep 2015 (ONLY FOR REFERENCE)
+        # Training period: Apr 1997 → Sep 2015 - contains PREDICTORS ONLY (no excess returns)
+        # Excess returns are computed dynamically in rolling window for each training period
         training_mask = (self.data['Date'] >= training_start) & (self.data['Date'] <= training_end)
         self.training_data = self.data[training_mask].copy().reset_index(drop=True)
+        
+        print(f"   📊 Initial training data range: {self.training_data['Date'].min().strftime('%Y-%m-%d')} to {self.training_data['Date'].max().strftime('%Y-%m-%d')} ({len(self.training_data)} obs)")
+        
+        # Verify that training data has the required PREDICTOR columns 
+        required_cols = ['dividend_yield', 'cpi_yoy', 'ftse_price', 'm_interbank_rate']
+        missing_cols = [col for col in required_cols if col not in self.training_data.columns]
+        if missing_cols:
+            print(f"   ⚠️  Missing columns in training data: {missing_cols}")
+        else:
+            print(f"   ✅ Training data has all required PREDICTOR columns: {required_cols}")
+            # Show data quality for predictors
+            valid_dividend = self.training_data['dividend_yield'].notna().sum()
+            valid_cpi = self.training_data['cpi_yoy'].notna().sum()
+            print(f"   📊 Valid dividend yield: {valid_dividend}/{len(self.training_data)} observations")
+            print(f"   📊 Valid CPI data: {valid_cpi}/{len(self.training_data)} observations")
+            print("   📝 NOTE: Excess returns computed dynamically in rolling window!")
         
         # Prediction period: Oct 2015 → Oct 2025 (use full_data for rolling window)
         max_available_date = data_source['Date'].max()
@@ -328,19 +316,32 @@ class PesaranTimmermannMultiPredictor:
         print(f"   5. Each iteration ADDS 6 months of new training data")
 
     def train_model(self):
-        """Train the predictive regression model on training data"""
-        print("\n🎓 TRAINING PHASE")
-        print("="*50)
-        print("OBJECTIVE: Estimate α̂ and β̂ coefficients")
-        print("Model: Excess_Return = α + β × Dividend_Yield + ε")
+        """REFERENCE METHOD - Shows multi-predictor model structure
+        
+        NOTE: This method is for reference only. In the actual rolling window methodology,
+        excess returns are computed dynamically for each expanding training window.
+        The real training happens in train_rolling_model() during rolling_window_predictions().
+        """
+        print("\n🎓 TRAINING PHASE - MULTI-PREDICTOR MODEL (REFERENCE)")
+        print("="*60)
+        print("OBJECTIVE: Estimate α̂, β̂₁ and β̂₂ coefficients")
+        print("Model: Excess_Return = α + β₁ × Dividend_Yield + β₂ × CPI_Growth + ε")
         print(f"Training period: {self.training_start} to {self.training_end}")
         print(f"For predicting: {self.prediction_start} onwards")
-        print("\nSTEPS:")
-        print("1. ✅ Computed 6-month stock returns: R_stock = (FTSE_{t+6} / FTSE_t) - 1")
-        print("2. ✅ Computed 6-month InterBank returns: R_interbank = (1 + annual_yield/100)^0.5 - 1") 
-        print("3. ✅ Computed excess returns: Y = R_stock - R_interbank")
-        print("4. ✅ Used dividend yield as predictor: X = Dividend_Yield_t")
-        print("5. 🔄 Running OLS regression: Y = α + β × X + ε")
+        print("\n📝 METHODOLOGY OVERVIEW:")
+        print("1. 🔄 Each rolling window computes excess returns dynamically for that training period")
+        print("2. 🔄 Uses EXPANDING windows: Apr 1997 → Sep 2015, then Apr 1997 → Mar 2016, etc.")
+        print("3. ✅ Uses TWO predictors: X₁ = Dividend_Yield_t, X₂ = CPI_Growth_t")
+        print("4. 🔄 Runs OLS regression: Y = α + β₁ × X₁ + β₂ × X₂ + ε")
+        print("5. 🎯 Uses coefficients to predict next 6-month direction")
+        
+        print(f"\n📊 TRAINING DATA SUMMARY:")
+        print(f"   📅 Period: {self.training_data['Date'].min().strftime('%Y-%m-%d')} to {self.training_data['Date'].max().strftime('%Y-%m-%d')}")
+        print(f"   📊 Observations: {len(self.training_data)}")
+        print(f"   📈 Contains: Price data, dividend yields, CPI data, InterBank rates")
+        
+        # NOW COMPUTE EXCESS RETURNS FOR REFERENCE TRAINING
+        print("\n🔄 Computing excess returns for initial training window (Apr 1997 → Sep 2015)...")
         
         if not STATSMODELS_AVAILABLE:
             print("   ❌ Statsmodels not available - using simple linear regression")
@@ -350,57 +351,113 @@ class PesaranTimmermannMultiPredictor:
             print("   ❌ No training data available")
             return
         
-        # Prepare training data
-        y_train = self.training_data['excess_return'].values  # Y: Dependent variable (excess returns)
-        X_train = self.training_data['dividend_yield'].values  # X: Independent variable (dividend yield)
+        # Compute 6-month returns for the training period (reference implementation)
+        training_data_copy = self.training_data.copy()
+        training_data_copy['ftse_6m_return'] = np.nan
+        training_data_copy['m_interbank_6m_return'] = np.nan
+        training_data_copy['excess_return'] = np.nan
+        
+        # Compute returns for training period (need full data to look ahead)
+        for idx in range(len(training_data_copy) - 6):  # Need 6 months ahead
+            current_date = training_data_copy.iloc[idx]['Date']
+            future_date = current_date + pd.DateOffset(months=6)
+            
+            # Find future price in full dataset
+            future_mask = (self.full_data['Date'] >= future_date - pd.DateOffset(days=15)) & \
+                         (self.full_data['Date'] <= future_date + pd.DateOffset(days=15))
+            future_data = self.full_data[future_mask]
+            
+            if len(future_data) > 0:
+                future_price = future_data.iloc[0]['ftse_price']
+                current_price = training_data_copy.iloc[idx]['ftse_price']
+                
+                # Stock return
+                stock_return = (future_price / current_price) - 1
+                training_data_copy.iloc[idx, training_data_copy.columns.get_loc('ftse_6m_return')] = stock_return
+                
+                # InterBank return (assuming annual rate, convert to 6-month return)
+                annual_rate = training_data_copy.iloc[idx]['m_interbank_rate'] / 100  # Convert % to decimal
+                interbank_return = (1 + annual_rate) ** 0.5 - 1  # 6-month = half-year compound
+                training_data_copy.iloc[idx, training_data_copy.columns.get_loc('m_interbank_6m_return')] = interbank_return
+                
+                # Excess return
+                excess_return = stock_return - interbank_return
+                training_data_copy.iloc[idx, training_data_copy.columns.get_loc('excess_return')] = excess_return
+        
+        # Keep only observations with valid excess returns
+        valid_data = training_data_copy.dropna(subset=['excess_return']).copy()
+        print(f"   ✅ Computed excess returns: {len(valid_data)}/{len(training_data_copy)} valid observations")
+        
+        # Prepare training data for multi-predictor model
+        y_train = valid_data['excess_return'].values  # Y: Dependent variable (excess returns)
+        X1_train = valid_data['dividend_yield'].values  # X₁: Dividend yield
+        X2_train = valid_data['cpi_yoy'].values  # X₂: CPI year-over-year growth
+        
+        # Create matrix with both predictors
+        X_train = np.column_stack([X1_train, X2_train])
         
         # Add constant term for regression intercept
         X_train_with_const = add_constant(X_train)
         
-        # Fit OLS regression to estimate α̂ and β̂
+        # Fit OLS regression to estimate α̂, β̂₁ and β̂₂
         self.model = OLS(y_train, X_train_with_const).fit()
         
-        print("\n📊 TRAINING RESULTS:")
-        print("-" * 40)
+        print("\n📊 MULTI-PREDICTOR TRAINING RESULTS:")
+        print("-" * 50)
         print(self.model.summary())
         
-        # Extract key statistics - these are α̂ and β̂
+        # Extract key statistics - α̂, β̂₁ (dividend yield), β̂₂ (CPI)
         alpha_hat = self.model.params[0]  # α̂ (intercept estimate)
-        beta_hat = self.model.params[1]   # β̂ (dividend yield coefficient estimate)
+        beta1_hat = self.model.params[1]  # β̂₁ (dividend yield coefficient)
+        beta2_hat = self.model.params[2]  # β̂₂ (CPI coefficient)
         alpha_pval = self.model.pvalues[0]
-        beta_pval = self.model.pvalues[1]
+        beta1_pval = self.model.pvalues[1]
+        beta2_pval = self.model.pvalues[2]
         r_squared = self.model.rsquared
         
         print(f"\n📈 ESTIMATED COEFFICIENTS:")
         print(f"   α̂ (alpha hat - intercept): {alpha_hat:.6f} (p-value: {alpha_pval:.4f})")
-        print(f"   β̂ (beta hat - dividend yield): {beta_hat:.6f} (p-value: {beta_pval:.4f})")
+        print(f"   β̂₁ (beta1 hat - dividend yield): {beta1_hat:.6f} (p-value: {beta1_pval:.4f})")
+        print(f"   β̂₂ (beta2 hat - CPI growth): {beta2_hat:.6f} (p-value: {beta2_pval:.4f})")
         print(f"   R-squared: {r_squared:.4f}")
         print(f"   Training observations: {len(self.training_data)}")
         
         # Store training results for use in prediction phase
         self.results['training'] = {
             'alpha_hat': alpha_hat,
-            'beta_hat': beta_hat,
+            'beta1_hat': beta1_hat,
+            'beta2_hat': beta2_hat,
             'alpha_pval': alpha_pval,
-            'beta_pval': beta_pval,
+            'beta1_pval': beta1_pval,
+            'beta2_pval': beta2_pval,
             'r_squared': r_squared,
             'observations': len(self.training_data)
         }
         
         # Interpretation
         print(f"\n💡 INTERPRETATION:")
-        if beta_pval < 0.05:
-            if beta_hat > 0:
+        if beta1_pval < 0.05:
+            if beta1_hat > 0:
                 print(f"   ✅ Dividend yield has POSITIVE predictive power")
-                print(f"   📈 1% higher dividend yield → {beta_hat*100:.2f}% higher excess return")
+                print(f"   📈 1% higher dividend yield → {beta1_hat*100:.2f}% higher excess return")
             else:
                 print(f"   ✅ Dividend yield has NEGATIVE predictive power")
-                print(f"   📉 1% higher dividend yield → {abs(beta_hat)*100:.2f}% lower excess return")
+                print(f"   📉 1% higher dividend yield → {abs(beta1_hat)*100:.2f}% lower excess return")
         else:
             print(f"   ❌ Dividend yield has NO significant predictive power")
-            
-        print(f"\n🎯 NEXT STEP: Use α̂ = {alpha_hat:.4f} and β̂ = {beta_hat:.4f} for prediction phase")
-    
+        
+        if beta2_pval < 0.05:
+            if beta2_hat > 0:
+                print(f"   ✅ CPI growth has POSITIVE predictive power")
+                print(f"   📈 1% higher CPI growth → {beta2_hat*100:.2f}% higher excess return")
+            else:
+                print(f"   ✅ CPI growth has NEGATIVE predictive power")
+                print(f"   📉 1% higher CPI growth → {abs(beta2_hat)*100:.2f}% lower excess return")
+        else:
+            print(f"   ❌ CPI growth has NO significant predictive power")
+
+        print(f"\n🎯 NEXT STEP: Use α̂ = {alpha_hat:.4f}, β̂₁ = {beta1_hat:.4f}, β̂₂ = {beta2_hat:.4f} for predictions")
+
     def train_model_simple(self):
         """Fallback simple linear regression using numpy"""
         print("   Using simple linear regression (numpy-based)")
@@ -482,105 +539,164 @@ class PesaranTimmermannMultiPredictor:
         print("METHODOLOGY: Re-estimate coefficients every 6 months")
         print("• Use expanding window: Always start from Apr 1997")
         print("• Update training end date every 6 months")
-        print("• Use α̂, β̂ + current dividend yield to predict next 6 months")
+        print("• Use α̂, β̂₁, β̂₂ + current dividend yield + current CPI to predict next 6 months")
         print("• No forward-looking bias: only use information available at prediction time")
         
-        # Create prediction periods (every 6 months starting Oct 2015)
-        prediction_dates = pd.date_range(
-            start=pd.to_datetime(self.prediction_start),
-            end=pd.to_datetime(self.prediction_end),
-            freq='6M'
-        )
+        # Create investment decision dates (1st of every 6th month starting Oct 1, 2015)
+        # Investment decisions made on: Oct 1 2015, Apr 1 2016, Oct 1 2016, Apr 1 2017, etc.
+        investment_dates = []
+        current_date = pd.Timestamp('2015-10-01')
+        end_date = pd.Timestamp('2025-04-01')
         
-        print(f"\n📅 Prediction schedule: {len(prediction_dates)} periods")
-        for i, date in enumerate(prediction_dates[:5]):  # Show first 5
-            print(f"   {i+1}. {date.strftime('%Y-%m-%d')}")
-        if len(prediction_dates) > 5:
-            print(f"   ... and {len(prediction_dates)-5} more periods")
+        while current_date <= end_date:
+            investment_dates.append(current_date)
+            # Add 6 months
+            if current_date.month == 10:  # October -> April
+                current_date = current_date.replace(year=current_date.year + 1, month=4)
+            else:  # April -> October
+                current_date = current_date.replace(month=10)
+        
+        print(f"\n📅 Investment decision schedule: {len(investment_dates)} periods")
+        print("   Investment decisions made on 1st of month using data available up to previous month-end:")
+        for i, date in enumerate(investment_dates[:5]):  # Show first 5
+            data_cutoff = (date - pd.DateOffset(days=1)) + pd.offsets.MonthEnd(0)  # Previous month-end
+            print(f"   {i+1}. {date.strftime('%Y-%m-%d')} (using data up to {data_cutoff.strftime('%Y-%m-%d')})")
+        if len(investment_dates) > 5:
+            print(f"   ... and {len(investment_dates)-5} more periods")
         
         # Initialize results storage
         rolling_results = []
         
-        for i, pred_date in enumerate(prediction_dates):
-            print(f"\n🔄 ITERATION {i+1}: Predicting for {pred_date.strftime('%Y-%m-%d')}")
+        for i, investment_date in enumerate(investment_dates):
+            print(f"\n🔄 ITERATION {i+1}: Investment decision for {investment_date.strftime('%Y-%m-%d')}")
             
-            # Define training end as 1 month before prediction date (use all data up to previous month)
-            training_end_date = pred_date - pd.DateOffset(months=1)
-            print(f"   📅 Training window: Apr 1997 → {training_end_date.strftime('%Y-%m-%d')}")
+            # Data cutoff: Use data available up to previous month-end (no forward-looking)
+            data_cutoff_date = (investment_date - pd.DateOffset(days=1)) + pd.offsets.MonthEnd(0)
+            print(f"   📅 Training window: Apr 1997 → {data_cutoff_date.strftime('%Y-%m-%d')} (expanding window)")
             
-            # Create training data (Apr 1997 → training_end_date)
+            # Create training data (Apr 1997 → data_cutoff_date)
             training_start_dt = pd.to_datetime(self.training_start)
             training_mask = (
                 (self.full_data['Date'] >= training_start_dt) & 
-                (self.full_data['Date'] <= training_end_date)
+                (self.full_data['Date'] <= data_cutoff_date)
             )
             current_training_data = self.full_data[training_mask].copy()
             
-            # For rolling window, we need to compute returns dynamically for this training period
-            # Compute returns for current training period
-            for idx in range(len(current_training_data)):
-                if idx + 6 < len(self.full_data):
-                    current_date = current_training_data.iloc[idx]['Date']
-                    future_idx = current_training_data.index[idx] + 6
-                    if future_idx < len(self.full_data):
-                        future_price = self.full_data.iloc[future_idx]['ftse_price']
-                        current_price = current_training_data.iloc[idx]['ftse_price']
-                        current_training_data.iloc[idx, current_training_data.columns.get_loc('ftse_6m_return')] = (
-                            future_price / current_price - 1
-                        )
+            # For expanding windows, compute 6-month returns dynamically for this specific training period
+            print(f"   📊 Computing returns for training window: {len(current_training_data)} observations")
             
-            # Compute InterBank returns and excess returns
-            current_training_data['m_interbank_6m_return'] = (1 + current_training_data['m_interbank_rate']/100)**(0.5) - 1
-            current_training_data['excess_return'] = (
-                current_training_data['ftse_6m_return'] - current_training_data['m_interbank_6m_return']
-            )
+            # Reset the return columns to avoid contamination
+            current_training_data['ftse_6m_return'] = np.nan
+            current_training_data['m_interbank_6m_return'] = np.nan
+            current_training_data['excess_return'] = np.nan
+            
+            # Compute 6-month forward returns for this training window only
+            print(f"   🧮 Computing 6-month forward returns for {len(current_training_data)} observations...")
+            print(f"      Note: Will compute for {len(current_training_data) - 6} observations (need 6 months ahead data)")
+            
+            valid_returns_count = 0
+            for idx in range(len(current_training_data) - 6):  # Need 6 months ahead data
+                current_date = current_training_data.iloc[idx]['Date']
+                future_date = current_date + pd.DateOffset(months=6)
+                
+                # Show progress for first few and last few observations
+                if idx < 3 or idx >= len(current_training_data) - 9:
+                    print(f"      [{idx+1:3d}] {current_date.strftime('%Y-%m-%d')} → {future_date.strftime('%Y-%m-%d')}")
+                elif idx == 3:
+                    print(f"      ... (computing for middle observations) ...")
+                
+                # Find future price in the FULL dataset (not just current_training_data)
+                # Use ±15 day window to handle weekends/holidays
+                future_mask = (self.full_data['Date'] >= future_date - pd.DateOffset(days=15)) & \
+                             (self.full_data['Date'] <= future_date + pd.DateOffset(days=15))
+                future_data = self.full_data[future_mask]
+                
+                if len(future_data) > 0:
+                    # Use closest future date
+                    closest_future = future_data.iloc[0]
+                    actual_future_date = closest_future['Date']
+                    future_price = closest_future['ftse_price']
+                    current_price = current_training_data.iloc[idx]['ftse_price']
+                    
+                    # Calculate stock return: (Future_Price / Current_Price) - 1
+                    stock_return = (future_price / current_price) - 1
+                    current_training_data.iloc[idx, current_training_data.columns.get_loc('ftse_6m_return')] = stock_return
+                    
+                    # Calculate InterBank return (assuming annual rate, convert to 6-month return)
+                    annual_rate = current_training_data.iloc[idx]['m_interbank_rate'] / 100  # Convert % to decimal
+                    interbank_return = (1 + annual_rate) ** 0.5 - 1  # 6-month = half-year compound
+                    current_training_data.iloc[idx, current_training_data.columns.get_loc('m_interbank_6m_return')] = interbank_return
+                    
+                    # Calculate excess return: Stock_Return - InterBank_Return
+                    excess_return = stock_return - interbank_return
+                    current_training_data.iloc[idx, current_training_data.columns.get_loc('excess_return')] = excess_return
+                    
+                    valid_returns_count += 1
+                    
+                    # Show detailed calculation for first few observations
+                    if idx < 2:
+                        print(f"         📊 Current: {current_price:.2f} → Future: {future_price:.2f} (on {actual_future_date.strftime('%Y-%m-%d')})")
+                        print(f"         📈 Stock return: {stock_return:.4f} ({stock_return*100:.2f}%)")
+                        print(f"         💰 InterBank rate: {annual_rate*100:.2f}% annual → {interbank_return*100:.2f}% 6-month")
+                        print(f"         ⚖️  Excess return: {excess_return:.4f} ({excess_return*100:.2f}%)")
+                else:
+                    if idx < 2:
+                        print(f"         ❌ No future data found for {future_date.strftime('%Y-%m-%d')}")
+            
+            print(f"   ✅ Successfully computed {valid_returns_count}/{len(current_training_data) - 6} valid 6-month returns")
             
             # Keep only observations with valid excess returns
             current_training_data = current_training_data.dropna(subset=['excess_return']).copy()
             
-            print(f"   📚 Training: {training_start_dt.strftime('%Y-%m')} to {training_end_date.strftime('%Y-%m')} ({len(current_training_data)} obs)")
+            print(f"   📚 Training: {training_start_dt.strftime('%Y-%m')} to {data_cutoff_date.strftime('%Y-%m')} ({len(current_training_data)} obs)")
             
             if len(current_training_data) < 24:  # Need minimum data
                 print(f"   ⚠️  Insufficient training data, skipping...")
                 continue
             
             # Train model on current data
-            alpha_hat, beta_hat, r_squared = self.train_rolling_model(current_training_data, i+1)
+            alpha_hat, beta1_hat, beta2_hat, r_squared = self.train_rolling_model(current_training_data, i+1)
             
             if alpha_hat is None:  # Training failed
                 continue
             
-            # Get dividend yield for prediction
-            div_yield_date = training_end_date  # Use most recent dividend yield
-            div_yield_mask = self.full_data['Date'] == div_yield_date
+            # Get dividend yield and CPI for prediction (use most recent values available)
+            predictor_date = data_cutoff_date
+            predictor_mask = self.full_data['Date'] == predictor_date
             
-            if not div_yield_mask.any():
+            if not predictor_mask.any():
                 # Find closest date
-                closest_idx = (self.full_data['Date'] - div_yield_date).abs().idxmin()
+                closest_idx = (self.full_data['Date'] - predictor_date).abs().idxmin()
                 current_div_yield = self.full_data.loc[closest_idx, 'dividend_yield']
+                current_cpi = self.full_data.loc[closest_idx, 'cpi_yoy']
                 actual_date = self.full_data.loc[closest_idx, 'Date']
-                print(f"   📊 Using dividend yield from {actual_date.strftime('%Y-%m-%d')}: {current_div_yield:.2f}%")
+                print(f"   📊 Using predictors from {actual_date.strftime('%Y-%m-%d')}: DivYield={current_div_yield:.2f}%, CPI={current_cpi:.2f}%")
             else:
-                current_div_yield = self.full_data[div_yield_mask]['dividend_yield'].iloc[0]
-                print(f"   📊 Dividend yield on {div_yield_date.strftime('%Y-%m-%d')}: {current_div_yield:.2f}%")
+                current_div_yield = self.full_data[predictor_mask]['dividend_yield'].iloc[0]
+                current_cpi = self.full_data[predictor_mask]['cpi_yoy'].iloc[0]
+                print(f"   📊 Predictors on {predictor_date.strftime('%Y-%m-%d')}: DivYield={current_div_yield:.2f}%, CPI={current_cpi:.2f}%")
             
-            # Make prediction
-            predicted_excess_return = alpha_hat + beta_hat * current_div_yield
-            investment_decision = "STOCKS" if predicted_excess_return > 0 else "INTERBANK"
+            # Make multi-predictor prediction
+            predicted_excess_return = alpha_hat + beta1_hat * current_div_yield + beta2_hat * current_cpi
+            investment_decision = "FTSE All Share Index" if predicted_excess_return > 0 else "Interbank Rate"
             
-            print(f"   🎯 Prediction: Ŷ = {alpha_hat:.6f} + {beta_hat:.6f} × {current_div_yield:.2f} = {predicted_excess_return:.4f}")
+            print(f"   🎯 Multi-predictor prediction:")
+            print(f"      Ŷ = {alpha_hat:.6f} + {beta1_hat:.6f}×{current_div_yield:.2f} + {beta2_hat:.6f}×{current_cpi:.2f}")
+            print(f"      Ŷ = {predicted_excess_return:.4f}")
             print(f"   💼 Investment Decision: {investment_decision}")
             
             # Store results with dates formatted properly
             rolling_results.append({
-                'prediction_date': pred_date.date(),  # Convert to date only
+                'prediction_date': investment_date.date(),  # Investment decision date
                 'training_start': training_start_dt.date(),  # Convert to date only
-                'training_end': training_end_date.date(),  # Convert to date only
+                'training_end': data_cutoff_date.date(),  # Data cutoff date
                 'training_observations': len(current_training_data),
                 'alpha_hat': alpha_hat,
-                'beta_hat': beta_hat,
+                'beta1_hat': beta1_hat,  # Dividend yield coefficient
+                'beta2_hat': beta2_hat,  # CPI growth coefficient
                 'r_squared': r_squared,
                 'dividend_yield': current_div_yield,
+                'cpi_growth': current_cpi,  # Store CPI value used for prediction
                 'predicted_excess_return': predicted_excess_return,
                 'invest_in_stocks': 1 if predicted_excess_return > 0 else 0,
                 'investment_decision': investment_decision
@@ -598,7 +714,7 @@ class PesaranTimmermannMultiPredictor:
         if len(rolling_results) > 0:
             output_dir = BASE_PATH / "Data" / "Output"
             output_dir.mkdir(parents=True, exist_ok=True)
-            coefficients_file = output_dir / "Rolling_Window_Coefficients_and_Predictions.xlsx"
+            coefficients_file = output_dir / "SMM265_DivYield_CPI_Rolling_Window_Coefficients_and_Predictions.xlsx"
             
             # Create a copy for saving with proper date formatting
             rolling_predictions_save = self.rolling_predictions.copy()
@@ -614,9 +730,11 @@ class PesaranTimmermannMultiPredictor:
         print(f"   Stock investments: {self.rolling_predictions['invest_in_stocks'].sum()}")
         print(f"   InterBank investments: {len(self.rolling_predictions) - self.rolling_predictions['invest_in_stocks'].sum()}")
         print(f"   Average α̂: {self.rolling_predictions['alpha_hat'].mean():.6f}")
-        print(f"   Average β̂: {self.rolling_predictions['beta_hat'].mean():.6f}")
+        print(f"   Average β̂₁ (div yield): {self.rolling_predictions['beta1_hat'].mean():.6f}")
+        print(f"   Average β̂₂ (CPI): {self.rolling_predictions['beta2_hat'].mean():.6f}")
         print(f"   α̂ range: [{self.rolling_predictions['alpha_hat'].min():.6f}, {self.rolling_predictions['alpha_hat'].max():.6f}]")
-        print(f"   β̂ range: [{self.rolling_predictions['beta_hat'].min():.6f}, {self.rolling_predictions['beta_hat'].max():.6f}]")
+        print(f"   β̂₁ range: [{self.rolling_predictions['beta1_hat'].min():.6f}, {self.rolling_predictions['beta1_hat'].max():.6f}]")
+        print(f"   β̂₂ range: [{self.rolling_predictions['beta2_hat'].min():.6f}, {self.rolling_predictions['beta2_hat'].max():.6f}]")
         
         # After generating all predictions, calculate actual returns for evaluation
         self.calculate_actual_returns_for_predictions()
@@ -646,17 +764,21 @@ class PesaranTimmermannMultiPredictor:
             investment_decision = row['investment_decision']
             predicted_excess_return = row['predicted_excess_return']
             
-            # Calculate 6-month period end date
-            period_end_date = pred_date + pd.DateOffset(months=6)
+            # Calculate investment period for return measurement
+            # Investment decision on Oct 1, 2015 using data up to Sep 30, 2015
+            # Investment period: Oct 1, 2015 → Mar 31, 2016 (6 months)  
+            # Return measurement: Oct 1, 2015 price → Mar 31, 2016 price
+            period_start_date = pred_date  # Start from investment decision date (e.g., Oct 1, 2015)
+            period_end_date = pred_date + pd.DateOffset(months=6) - pd.DateOffset(days=1)  # End of 6th month (e.g., Mar 31, 2016)
             
-            print(f"\n🔍 EVALUATION {idx+1}: Prediction for {pred_date.strftime('%Y-%m-%d')}")
-            print(f"   📅 Investment period: {pred_date.strftime('%Y-%m-%d')} → {period_end_date.strftime('%Y-%m-%d')}")
-            print(f"   💼 Predicted decision: {investment_decision}")
+            print(f"\n🔍 EVALUATION {idx+1}: Investment decision for {pred_date.strftime('%Y-%m-%d')}")
+            print(f"   📅 Calculated period: {period_start_date.strftime('%Y-%m-%d')} → {period_end_date.strftime('%Y-%m-%d')}")
+            print(f"   💼 Investment decision: {investment_decision}")
             print(f"   📈 Predicted excess return: {predicted_excess_return:.4f}")
             
             # Get actual returns for this period
             actual_ftse_return, actual_interbank_return = self.calculate_period_actual_returns(
-                pred_date, period_end_date
+                period_start_date, period_end_date
             )
             
             if actual_ftse_return is not None and actual_interbank_return is not None:
@@ -670,7 +792,7 @@ class PesaranTimmermannMultiPredictor:
                 )
                 
                 # Calculate switching strategy return
-                switching_return = actual_ftse_return if investment_decision == "STOCKS" else actual_interbank_return
+                switching_return = actual_ftse_return if investment_decision == "FTSE All Share Index" else actual_interbank_return
                 
                 # Buy-and-hold return (always FTSE)
                 buyhold_return = actual_ftse_return
@@ -754,30 +876,42 @@ class PesaranTimmermannMultiPredictor:
             end_date = end_date.date()
         
         # Find start and end data points in dataset
+        # For investment period Oct 1 → Mar 31, we want:
+        # Start: Price just before Oct 1 (i.e., Sep 30)
+        # End: Price on or after Mar 31
         data_source = data_source.copy()
         data_source['date_only'] = data_source['Date'].dt.date
         
+        # For start date: find date <= start_date (on or just before investment starts)
         start_mask = data_source['date_only'] <= start_date
-        end_mask = data_source['date_only'] <= end_date
+        # For end date: find first date >= end_date (on or after investment ends)
+        end_mask = data_source['date_only'] >= end_date
         
         if not start_mask.any() or not end_mask.any():
             print(f"   ❌ No data found for period {start_date} to {end_date}")
             return None, None
         
         # Get closest available dates
-        start_idx = data_source[start_mask].index[-1]  # Latest date <= start_date
+        # First try to find exact start date
+        exact_start_mask = data_source['date_only'] == start_date
+        if exact_start_mask.any():
+            start_idx = data_source[exact_start_mask].index[0]  # Exact date
+        else:
+            start_idx = data_source[start_mask].index[-1]  # Last date <= start_date
+        
         end_indices = data_source[end_mask].index
         
-        if len(end_indices) == 0 or end_indices[-1] <= start_idx:
+        if len(end_indices) == 0 or end_indices[0] <= start_idx:
             print(f"   ❌ Insufficient data range for period {start_date} to {end_date}")
             return None, None
         
-        end_idx = end_indices[-1]  # Latest date <= end_date
+        end_idx = end_indices[0]  # First date >= end_date
         
-        start_data = data_source.iloc[start_idx]
+        start_data = data_source.iloc[start_idx+1]  # Use the next date after start_idx for investment start
         end_data = data_source.iloc[end_idx]
         
-        actual_start_date = start_data['Date'].date()
+        # For display purposes, show investment start as 1st of month since decisions are made on 1st
+        actual_start_date = start_data['Date'].replace(day=1).date()
         actual_end_date = end_data['Date'].date()
         
         print(f"      📅 Actual period: {actual_start_date} to {actual_end_date}")
@@ -787,22 +921,37 @@ class PesaranTimmermannMultiPredictor:
         ftse_end_price = end_data['ftse_price']
         actual_ftse_return = (ftse_end_price / ftse_start_price) - 1
         
-        # Calculate actual InterBank return using the rates during the period
-        # We'll use the average InterBank rate during the investment period
+        # Calculate actual InterBank return by compounding monthly rates
+        # For each month in the investment period, compound the monthly InterBank rate
         period_mask = (
             (data_source['date_only'] >= actual_start_date) & 
             (data_source['date_only'] <= actual_end_date)
         )
-        period_data = data_source[period_mask]
+        period_data = data_source[period_mask].sort_values('Date')
         
         if len(period_data) > 0:
-            avg_interbank_rate = period_data['m_interbank_rate'].mean()
-            # Calculate return for the actual period length
-            period_length_years = (actual_end_date - actual_start_date).days / 365.25
-            actual_interbank_return = (1 + avg_interbank_rate/100)**period_length_years - 1
-            
             print(f"      💰 FTSE price: {ftse_start_price:.2f} → {ftse_end_price:.2f}")
-            print(f"      📈 Avg InterBank rate: {avg_interbank_rate:.2f}% for {period_length_years:.2f} years")
+            print(f"      📊 Monthly InterBank compounding over {len(period_data)} months:")
+            
+            # Start with $1 investment
+            interbank_value = 1.0
+            
+            for idx, row in period_data.iterrows():
+                monthly_rate = row['m_interbank_rate'] / 100  # Convert % to decimal
+                monthly_return = (1 + monthly_rate) ** (1/12) - 1  # Convert annual to monthly
+                interbank_value *= (1 + monthly_return)  # Compound monthly
+                
+                # Show details for first few and last few months
+                month_num = len([i for i in period_data.index if i <= idx])
+                if month_num <= 3 or month_num > len(period_data) - 3:
+                    print(f"         Month {month_num}: {monthly_rate*100:.2f}% annual → {monthly_return*100:.3f}% monthly → Value: {interbank_value:.6f}")
+                elif month_num == 4:
+                    print(f"         ... (compounding middle months) ...")
+            
+            # Total return over the period
+            actual_interbank_return = interbank_value - 1
+            
+            print(f"      📈 Final InterBank return: {actual_interbank_return*100:.3f}% (compounded monthly)")
         else:
             # Fallback to using start period rate
             start_interbank_rate = start_data['m_interbank_rate']
@@ -902,7 +1051,7 @@ class PesaranTimmermannMultiPredictor:
         output_dir = BASE_PATH / "Data" / "Output"
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        evaluation_file = output_dir / "Strategy_Evaluation_Results.xlsx"
+        evaluation_file = output_dir / "SMM265_DivYield_CPI_Strategy_Evaluation_Results.xlsx"
         
         # Create copies for saving with proper date formatting
         rolling_predictions_save = self.rolling_predictions.copy()
@@ -933,37 +1082,43 @@ class PesaranTimmermannMultiPredictor:
         print(f"   📅 All dates saved in date-only format (no timestamps)")
     
     def train_rolling_model(self, training_data, iteration):
-        """Train model for rolling window iteration"""
+        """Train multi-predictor model for rolling window iteration"""
         try:
-            # Prepare data
+            # Prepare multi-predictor data
             y_train = training_data['excess_return'].values
-            X_train = training_data['dividend_yield'].values
+            X1_train = training_data['dividend_yield'].values  # Predictor 1: Dividend Yield
+            X2_train = training_data['cpi_yoy'].values  # Predictor 2: CPI Growth
             
-            # Run regression
+            # Create matrix with both predictors
+            X_train = np.column_stack([X1_train, X2_train])
+            
+            # Run multi-predictor regression
             if STATSMODELS_AVAILABLE:
                 X_train_with_const = add_constant(X_train)
                 model = OLS(y_train, X_train_with_const).fit()
-                alpha_hat = model.params[0]
-                beta_hat = model.params[1]
+                alpha_hat = model.params[0]  # α̂
+                beta1_hat = model.params[1]  # β̂₁ (dividend yield)
+                beta2_hat = model.params[2]  # β̂₂ (CPI growth)
                 r_squared = model.rsquared
             else:
-                # Simple regression fallback
+                # Simple regression fallback for multi-predictor
                 X_matrix = np.column_stack([np.ones(len(X_train)), X_train])
                 coefficients = np.linalg.inv(X_matrix.T @ X_matrix) @ X_matrix.T @ y_train
                 alpha_hat = coefficients[0]
-                beta_hat = coefficients[1]
+                beta1_hat = coefficients[1]
+                beta2_hat = coefficients[2]
                 
                 y_pred = X_matrix @ coefficients
                 ss_res = np.sum((y_train - y_pred) ** 2)
                 ss_tot = np.sum((y_train - np.mean(y_train)) ** 2)
                 r_squared = 1 - (ss_res / ss_tot)
             
-            print(f"   📈 Coefficients: α̂ = {alpha_hat:.6f}, β̂ = {beta_hat:.6f}, R² = {r_squared:.4f}")
-            return alpha_hat, beta_hat, r_squared
+            print(f"   📈 Multi-predictor coefficients: α̂ = {alpha_hat:.6f}, β̂₁ = {beta1_hat:.6f}, β̂₂ = {beta2_hat:.6f}, R² = {r_squared:.4f}")
+            return alpha_hat, beta1_hat, beta2_hat, r_squared
             
         except Exception as e:
-            print(f"   ❌ Training failed: {e}")
-            return None, None, None
+            print(f"   ❌ Multi-predictor training failed: {e}")
+            return None, None, None, None
     
     def make_predictions(self):
         """Make predictions and evaluate investment strategy"""
@@ -1154,11 +1309,14 @@ class PesaranTimmermannMultiPredictor:
         
         # Save the plot
         output_dir = BASE_PATH / "Data" / "Output"
-        plot_file = output_dir / "Predicted_vs_Actual_Returns_TimeSeries.png"
-        plt.savefig(plot_file, dpi=300, bbox_inches='tight')
-        print(f"   💾 Time-series plot saved to: {plot_file.name}")
+        plot_file = output_dir / "SMM265_DivYield_CPI_Predicted_vs_Actual_Returns_TimeSeries.png"
         
-        plt.show()
+        # Turn off interactive mode to prevent display
+        plt.ioff()
+        plt.savefig(plot_file, dpi=300, bbox_inches='tight')
+        plt.close()  # Close the figure to free memory
+        
+        print(f"   💾 Time-series plot saved to: {plot_file.name}")
     
     def plot_cumulative_returns_chart(self):
         """Create cumulative returns chart comparing switching strategy vs buy-and-hold"""
@@ -1196,7 +1354,7 @@ class PesaranTimmermannMultiPredictor:
         plt.axhline(y=1.0, color='black', linestyle='--', alpha=0.5, linewidth=1)
         
         # Formatting
-        plt.title('Cumulative Returns: Switching Strategy vs Buy-and-Hold\n(Pesaran & Timmermann Rolling Window 2015-2025)', 
+        plt.title('Cumulative Returns Dividend Yield & CPI: Switching Strategy vs Buy-and-Hold\n(Pesaran & Timmermann Rolling Window 2015-2025)', 
                   fontsize=14, fontweight='bold')
         plt.xlabel('Date', fontsize=12)
         plt.ylabel('Cumulative Return (1 = No Change)', fontsize=12)
@@ -1226,11 +1384,11 @@ class PesaranTimmermannMultiPredictor:
         
         # Save the plot
         output_dir = BASE_PATH / "Data" / "Output"
-        plot_file = output_dir / "Cumulative_Returns_Strategy_Comparison.png"
+        plot_file = output_dir / "SMM265_DivYield_CPI_Cumulative_Returns_Strategy_Comparison.png"
+        plt.ioff()
         plt.savefig(plot_file, dpi=300, bbox_inches='tight')
+        plt.close()
         print(f"   💾 Cumulative returns chart saved to: {plot_file.name}")
-        
-        plt.show()
     
     def create_pt_test_table(self):
         """Create Pesaran-Timmermann Sign Test Statistics table as an image"""
@@ -1253,8 +1411,16 @@ class PesaranTimmermannMultiPredictor:
         proportion_correct = correct_predictions / total_predictions
         expected_proportion = 0.5  # Under null hypothesis
         
-        # Number of switches (our model always chose STOCKS)
-        num_switches = 0  # All predictions were STOCKS
+        # Calculate actual number of switches between strategies
+        # A switch occurs when invest_in_stocks changes from one period to the next
+        invest_decisions = test_data['invest_in_stocks'].values
+        num_switches = 0
+        for i in range(1, len(invest_decisions)):
+            if invest_decisions[i] != invest_decisions[i-1]:
+                num_switches += 1
+        
+        print(f"   📊 Investment decisions: {invest_decisions}")
+        print(f"   🔄 Number of switches detected: {num_switches}")
         
         # Calculate PT test statistic
         pstar = 0.5
@@ -1342,7 +1508,7 @@ class PesaranTimmermannMultiPredictor:
         
         # Save the table
         output_dir = BASE_PATH / "Data" / "Output"
-        table_file = output_dir / "Pesaran_Timmermann_Sign_Test_Table.png"
+        table_file = output_dir / "SMM265_DivYield_CPI_Test_Statistics_and_Significance_Results.png"
         plt.savefig(table_file, dpi=300, bbox_inches='tight', 
                     facecolor='white', edgecolor='none', pad_inches=0.2)
         print(f"   💾 PT test table saved to: {table_file.name}")
@@ -1352,158 +1518,251 @@ class PesaranTimmermannMultiPredictor:
         print(f"   📊 Test statistic: {pt_statistic:.3f}, p-value: {p_value_one_sided:.3f}")
         print(f"   🎯 Significant at 5%: {'Yes' if significant_5pct else 'No'}")
         
-        plt.show()
+        plt.close()
     
-    def create_recursive_predictions_table(self):
-        """Create Table 1: Recursive Predictions and Actual Excess Returns"""
-        print("\n📊 Creating Recursive Predictions Table...")
+    def create_pt_predictions_table(self):
+        """Create Pesaran-Timmermann Predictions vs Actual Results Table"""
+        print("\n📊 Creating PT Predictions vs Actual Results Table...")
         
         if not hasattr(self, 'rolling_predictions') or len(self.rolling_predictions) == 0:
-            print("   ❌ No rolling predictions available for table creation")
+            print("   ❌ No rolling predictions available for PT predictions table")
             return
         
         # Filter out rows with missing actual returns
-        table_data_df = self.rolling_predictions.dropna(subset=['actual_excess_return']).copy()
+        table_data = self.rolling_predictions.dropna(subset=['actual_excess_return']).copy()
         
-        if len(table_data_df) == 0:
-            print("   ❌ No complete prediction-actual pairs available for table")
+        if len(table_data) == 0:
+            print("   ❌ No complete prediction-actual pairs available for PT predictions table")
             return
         
-        # Prepare data for the table
-        table_data = []
-        for _, row in table_data_df.iterrows():
-            # Create period string (6 months from prediction date)
-            pred_date = pd.to_datetime(row['prediction_date'])
-            end_date = pred_date + pd.DateOffset(months=6)
-            period_str = f"{pred_date.strftime('%b %Y')} - {end_date.strftime('%b %Y')}"
-            
-            # Get values
-            actual_return = row['actual_excess_return']
-            predicted_return = row['predicted_excess_return']
-            sign_correct = "✓" if row['prediction_correct'] else "✗"
-            trading_decision = row['investment_decision']
-            return_achieved = row['switching_strategy_return']
-            
-            table_data.append([
-                period_str,
-                actual_return,
-                predicted_return,
-                sign_correct,
-                trading_decision,
-                return_achieved
-            ])
-        
-        # Calculate summary statistics
-        total_predictions = len(table_data)
-        correct_predictions = sum(1 for row in table_data if row[3] == "✓")
-        accuracy_percentage = (correct_predictions / total_predictions) * 100
-        
-        # Create figure with proper size for the table
-        fig, ax = plt.subplots(figsize=(16, max(12, len(table_data) * 0.5 + 4)))
+        # Create figure with appropriate size for the table
+        fig, ax = plt.subplots(figsize=(16, max(8, len(table_data) * 0.4)))
         ax.axis('off')
         
         # Table title
-        title = "Table 1: Recursive Predictions and Actual Excess Returns\nFTSE All-Share Index - Rolling Window Analysis (2015-2025)"
-        ax.text(0.5, 0.98, title, transform=ax.transAxes, 
-                fontsize=16, fontweight='bold', ha='center', va='top')
+        title = "Table 1 Pesaran-Timmermann Model: Predictions vs Actual Results\nMulti-Predictor Strategy (Dividend Yield + CPI)"
+        fig.suptitle(title, fontsize=14, fontweight='bold', y=0.95)
         
-        # Column headers
-        headers = ["Period", "Actual\nReturn", "Predicted\nReturn", "Sign\nCorrect?", "Trading\nDecision", "Return\nAchieved"]
+        # Prepare table data
+        table_rows = []
+        headers = ['Period', 'Date', 'Predicted\nExcess Return (%)', 'Actual\nExcess Return (%)', 
+                  'Investment\nDecision', 'Prediction\nCorrect']
         
-        # Prepare formatted data for table
-        formatted_data = []
-        for row in table_data:
-            formatted_row = [
-                row[0],  # Period
-                f"{row[1]:.3f}",  # Actual return
-                f"{row[2]:.3f}",  # Predicted return
-                row[3],  # Sign correct
-                row[4],  # Trading decision
-                f"{row[5]:.3f}"   # Return achieved
-            ]
-            formatted_data.append(formatted_row)
+        for idx, row in table_data.iterrows():
+            period = len(table_rows) + 1
+            date = row['prediction_date'].strftime('%Y-%m-%d') if pd.notna(row['prediction_date']) else 'N/A'
+            pred_return = f"{row['predicted_excess_return']*100:.2f}%"
+            actual_return = f"{row['actual_excess_return']*100:.2f}%"
+            investment = row['investment_decision']
+            pred_correct = "✓" if row['prediction_correct'] else "✗"
+            
+            table_rows.append([
+                str(period), date, pred_return, actual_return, 
+                investment, pred_correct
+            ])
         
-        # Calculate table position based on number of rows
-        table_height = min(0.75, len(formatted_data) * 0.03 + 0.15)
-        table_y = 0.95 - table_height
-        
-        # Create the main table
-        table = ax.table(cellText=formatted_data,
+        # Create the table
+        table = ax.table(cellText=table_rows,
                         colLabels=headers,
                         cellLoc='center',
                         loc='center',
-                        bbox=[0.05, table_y, 0.9, table_height])
+                        bbox=[0.05, 0.1, 0.9, 0.8])
         
         # Style the table
         table.auto_set_font_size(False)
-        table.set_fontsize(min(10, max(7, 120 // len(formatted_data))))
+        table.set_fontsize(8)
         table.scale(1, 1.5)
         
-        # Style headers
+        # Style header row
         for i in range(len(headers)):
             table[(0, i)].set_facecolor('#4472C4')
             table[(0, i)].set_text_props(weight='bold', color='white')
+            table[(0, i)].set_height(0.08)
         
-        # Style data rows
-        for i in range(1, len(formatted_data) + 1):
+        # Style data rows with alternating colors
+        for i in range(1, len(table_rows) + 1):
             for j in range(len(headers)):
-                # Alternate row colors
                 if i % 2 == 0:
                     table[(i, j)].set_facecolor('#F2F2F2')
                 else:
                     table[(i, j)].set_facecolor('#FFFFFF')
                 
                 # Highlight correct/incorrect predictions
-                if j == 3:  # Sign Correct column
-                    if formatted_data[i-1][j] == "✓":
-                        table[(i, j)].set_facecolor('#D5E8D4')
-                        table[(i, j)].set_text_props(color='green', weight='bold')
+                if j == 5:  # Prediction Correct column
+                    if table_rows[i-1][j] == "✓":
+                        table[(i, j)].set_facecolor('#D4F6D4')  # Light green
                     else:
-                        table[(i, j)].set_facecolor('#F8CECC')
-                        table[(i, j)].set_text_props(color='red', weight='bold')
-                
-                # Style trading decision column
-                if j == 4:  # Trading Decision column
-                    table[(i, j)].set_text_props(weight='bold')
-                
-                # Add borders
-                table[(i, j)].set_edgecolor('black')
-                table[(i, j)].set_linewidth(0.5)
+                        table[(i, j)].set_facecolor('#F6D4D4')  # Light red
         
-        # Add separator line and summary
-        summary_y = table_y - 0.05
-        separator_line = "─" * 80
-        ax.text(0.5, summary_y, separator_line, transform=ax.transAxes,
-                fontsize=12, ha='center', va='center', family='monospace')
+        # Add summary statistics at the bottom
+        correct_predictions = table_data['prediction_correct'].sum()
+        total_predictions = len(table_data)
+        accuracy = correct_predictions / total_predictions * 100
         
-        # Add summary statistics
-        summary_text = f"Total correct: {correct_predictions} out of {total_predictions} ({accuracy_percentage:.1f}%)"
-        ax.text(0.5, summary_y - 0.03, summary_text, transform=ax.transAxes,
-                fontsize=12, ha='center', va='center', weight='bold')
-        
-        ax.text(0.5, summary_y - 0.06, separator_line, transform=ax.transAxes,
-                fontsize=12, ha='center', va='center', family='monospace')
-        
-        # Add methodology note
-        methodology_note = ("Note: Predictions based on dividend yield model with rolling 6-month re-estimation.\n"
-                           "Trading decision: 'Stocks' if predicted excess return > 0, otherwise 'Bonds'.")
-        
-        ax.text(0.5, 0.02, methodology_note, transform=ax.transAxes,
-                fontsize=9, ha='center', va='bottom', style='italic')
+        summary_text = f"Summary: {correct_predictions}/{total_predictions} correct predictions ({accuracy:.1f}% accuracy)"
+        fig.text(0.5, 0.05, summary_text, ha='center', fontsize=12, fontweight='bold')
         
         plt.tight_layout()
         
         # Save the table
         output_dir = BASE_PATH / "Data" / "Output"
-        table_file = output_dir / "Recursive_Predictions_Table.png"
+        table_file = output_dir / "SMM265_DivYield_CPI_PT_Predictions_vs_Actual_Table.png"
+        plt.ioff()
         plt.savefig(table_file, dpi=300, bbox_inches='tight', 
                     facecolor='white', edgecolor='none', pad_inches=0.3)
-        print(f"   💾 Recursive predictions table saved to: {table_file.name}")
-        
-        # Print summary statistics
-        print(f"   📈 {correct_predictions}/{total_predictions} correct predictions ({accuracy_percentage:.1f}%)")
-        
-        plt.show()
+        plt.close()
+        print(f"   💾 PT predictions table saved to: {table_file.name}")
+    
+    # def create_recursive_predictions_table(self):
+    #     """Create Table 1: Recursive Predictions and Actual Excess Returns"""
+    #     print("\n📊 Creating Recursive Predictions Table...")
+    #     
+    #     if not hasattr(self, 'rolling_predictions') or len(self.rolling_predictions) == 0:
+    #         print("   ❌ No rolling predictions available for table creation")
+    #         return
+    #     
+    #     # Filter out rows with missing actual returns
+    #     table_data_df = self.rolling_predictions.dropna(subset=['actual_excess_return']).copy()
+    #     
+    #     if len(table_data_df) == 0:
+    #         print("   ❌ No complete prediction-actual pairs available for table")
+    #         return
+    #     
+    #     # Prepare data for the table
+    #     table_data = []
+    #     for _, row in table_data_df.iterrows():
+    #         # Create period string (6 months from prediction date)
+    #         pred_date = pd.to_datetime(row['prediction_date'])
+    #         end_date = pred_date + pd.DateOffset(months=6)
+    #         period_str = f"{pred_date.strftime('%b %Y')} - {end_date.strftime('%b %Y')}"
+    #         
+    #         # Get values
+    #         actual_return = row['actual_excess_return']
+    #         predicted_return = row['predicted_excess_return']
+    #         sign_correct = "✓" if row['prediction_correct'] else "✗"
+    #         trading_decision = row['investment_decision']
+    #         return_achieved = row['switching_strategy_return']
+    #         
+    #         table_data.append([
+    #             period_str,
+    #             actual_return,
+    #             predicted_return,
+    #             sign_correct,
+    #             trading_decision,
+    #             return_achieved
+    #         ])
+    #     
+    #     # Calculate summary statistics
+    #     total_predictions = len(table_data)
+    #     correct_predictions = sum(1 for row in table_data if row[3] == "✓")
+    #     accuracy_percentage = (correct_predictions / total_predictions) * 100
+    #     
+    #     # Create figure with proper size for the table
+    #     fig, ax = plt.subplots(figsize=(16, max(12, len(table_data) * 0.5 + 4)))
+    #     ax.axis('off')
+    #     
+    #     # Table title
+    #     title = "Table 1: Recursive Predictions and Actual Excess Returns\nFTSE All-Share Index - Rolling Window Analysis (2015-2025)"
+    #     ax.text(0.5, 0.98, title, transform=ax.transAxes, 
+    #             fontsize=16, fontweight='bold', ha='center', va='top')
+    #     
+    #     # Column headers
+    #     headers = ["Period", "Actual\nReturn", "Predicted\nReturn", "Sign\nCorrect?", "Trading\nDecision", "Return\nAchieved"]
+    #     
+    #     # Prepare formatted data for table
+    #     formatted_data = []
+    #     for row in table_data:
+    #         formatted_row = [
+    #             row[0],  # Period
+    #             f"{row[1]:.3f}",  # Actual return
+    #             f"{row[2]:.3f}",  # Predicted return
+    #             row[3],  # Sign correct
+    #             row[4],  # Trading decision
+    #             f"{row[5]:.3f}"   # Return achieved
+    #         ]
+    #         formatted_data.append(formatted_row)
+    #     
+    #     # Calculate table position based on number of rows
+    #     table_height = min(0.75, len(formatted_data) * 0.03 + 0.15)
+    #     table_y = 0.95 - table_height
+    #     
+    #     # Create the main table
+    #     table = ax.table(cellText=formatted_data,
+    #                     colLabels=headers,
+    #                     cellLoc='center',
+    #                     loc='center',
+    #                     bbox=[0.05, table_y, 0.9, table_height])
+    #     
+    #     # Style the table
+    #     table.auto_set_font_size(False)
+    #     table.set_fontsize(min(10, max(7, 120 // len(formatted_data))))
+    #     table.scale(1, 1.5)
+    #     
+    #     # Style headers
+    #     for i in range(len(headers)):
+    #         table[(0, i)].set_facecolor('#4472C4')
+    #         table[(0, i)].set_text_props(weight='bold', color='white')
+    #     
+    #     # Style data rows
+    #     for i in range(1, len(formatted_data) + 1):
+    #         for j in range(len(headers)):
+    #             # Alternate row colors
+    #             if i % 2 == 0:
+    #                 table[(i, j)].set_facecolor('#F2F2F2')
+    #             else:
+    #                 table[(i, j)].set_facecolor('#FFFFFF')
+    #             
+    #             # Highlight correct/incorrect predictions
+    #             if j == 3:  # Sign Correct column
+    #                 if formatted_data[i-1][j] == "✓":
+    #                     table[(i, j)].set_facecolor('#D5E8D4')
+    #                     table[(i, j)].set_text_props(color='green', weight='bold')
+    #                 else:
+    #                     table[(i, j)].set_facecolor('#F8CECC')
+    #                     table[(i, j)].set_text_props(color='red', weight='bold')
+    #             
+    #             # Style trading decision column
+    #             if j == 4:  # Trading Decision column
+    #                 table[(i, j)].set_text_props(weight='bold')
+    #             
+    #             # Add borders
+    #             table[(i, j)].set_edgecolor('black')
+    #             table[(i, j)].set_linewidth(0.5)
+    #     
+    #     # Add separator line and summary
+    #     summary_y = table_y - 0.05
+    #     separator_line = "─" * 80
+    #     ax.text(0.5, summary_y, separator_line, transform=ax.transAxes,
+    #             fontsize=12, ha='center', va='center', family='monospace')
+    #     
+    #     # Add summary statistics
+    #     summary_text = f"Total correct: {correct_predictions} out of {total_predictions} ({accuracy_percentage:.1f}%)"
+    #     ax.text(0.5, summary_y - 0.03, summary_text, transform=ax.transAxes,
+    #             fontsize=12, ha='center', va='center', weight='bold')
+    #     
+    #     ax.text(0.5, summary_y - 0.06, separator_line, transform=ax.transAxes,
+    #             fontsize=12, ha='center', va='center', family='monospace')
+    #     
+    #     # Add methodology note
+    #     methodology_note = ("Note: Predictions based on dividend yield model with rolling 6-month re-estimation.\n"
+    #                        "Trading decision: 'Stocks' if predicted excess return > 0, otherwise 'Bonds'.")
+    #     
+    #     ax.text(0.5, 0.02, methodology_note, transform=ax.transAxes,
+    #             fontsize=9, ha='center', va='bottom', style='italic')
+    #     
+    #     plt.tight_layout()
+    #     
+    #     # Save the table
+    #     output_dir = BASE_PATH / "Data" / "Output"
+    #     table_file = output_dir / "SMM265_DivYield_CPI_Recursive_Predictions_Table.png"
+    #     plt.ioff()
+    #     plt.savefig(table_file, dpi=300, bbox_inches='tight', 
+    #                 facecolor='white', edgecolor='none', pad_inches=0.3)
+    #     plt.close()
+    #     print(f"   💾 Recursive predictions table saved to: {table_file.name}")
+    #     
+    #     # Print summary statistics
+    #     print(f"   📈 {correct_predictions}/{total_predictions} correct predictions ({accuracy_percentage:.1f}%)")
     
     def create_simple_visualizations(self):
         """Create basic visualizations"""
@@ -1544,7 +1803,14 @@ class PesaranTimmermannMultiPredictor:
         ax4.legend()
         
         plt.tight_layout()
-        plt.show()
+        
+        # Save instead of showing
+        output_dir = BASE_PATH / "Data" / "Output"
+        plot_file = output_dir / "SMM265_DivYield_CPI_Simple_Visualizations.png"
+        plt.ioff()
+        plt.savefig(plot_file, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"   💾 Simple visualizations saved to: {plot_file.name}")
     
     def run_full_analysis(self):
         """Run the complete rolling window analysis with evaluation"""
@@ -1579,9 +1845,10 @@ class PesaranTimmermannMultiPredictor:
                 
                 # Generate Pesaran-Timmermann test table
                 self.create_pt_test_table()
+                self.create_pt_predictions_table()
                 
                 # Generate recursive predictions table
-                self.create_recursive_predictions_table()
+                # self.create_recursive_predictions_table()  # Commented out - not needed
             else:
                 print(f"\n❌ No rolling predictions generated - check data availability")
             
@@ -1630,8 +1897,8 @@ class PesaranTimmermannMultiPredictor:
             print(f"   • Invested in InterBank: {interbank_decisions}/{total_decisions} periods ({interbank_decisions/total_decisions*100:.1f}%)")
         
         print(f"\n📄 OUTPUT FILES:")
-        print(f"   • Strategy_Evaluation_Results.xlsx - Detailed evaluation results")
-        print(f"   • Rolling_Window_Coefficients_and_Predictions.xlsx - Model coefficients")
+        print(f"   • SMM265_DivYield_CPI_Strategy_Evaluation_Results.xlsx - Detailed evaluation results")
+        print(f"   • SMM265_DivYield_CPI_Rolling_Window_Coefficients_and_Predictions.xlsx - Model coefficients")
         
         # Final verdict
         return_advantage = metrics['switching_annual_return'] - metrics['buyhold_annual_return']
@@ -1640,7 +1907,7 @@ class PesaranTimmermannMultiPredictor:
         print(f"\n" + "="*80)
         print(f"🏆 FINAL VERDICT:")
         if return_advantage > 0 and sharpe_advantage > 0:
-            print(f"   ✅ STRATEGY SUCCESS: The dividend yield switching strategy outperformed")
+            print(f"   ✅ STRATEGY SUCCESS: The multi-predictor switching strategy outperformed")
             print(f"      buy-and-hold in both returns ({return_advantage*100:.1f}%) and risk-adjusted returns ({sharpe_advantage:.3f})")
         elif return_advantage > 0:
             print(f"   📈 MIXED RESULTS: Higher returns ({return_advantage*100:.1f}%) but lower risk-adjusted performance")
@@ -1651,9 +1918,160 @@ class PesaranTimmermannMultiPredictor:
             
         print(f"   📊 Prediction accuracy: {metrics['accuracy']*100:.1f}% - {'Good' if metrics['accuracy'] > 0.6 else 'Moderate' if metrics['accuracy'] > 0.5 else 'Poor'}")
         print(f"="*80)
+        
+        # Create and save performance table
+        self.create_performance_table(metrics)
+    
+    def create_performance_table(self, metrics):
+        """Create a professional performance summary table as an image"""
+        try:
+            from matplotlib.patches import FancyBboxPatch
+            
+            # Create output directory if it doesn't exist
+            output_dir = Path("output").resolve()  # Use absolute path
+            output_dir.mkdir(exist_ok=True)
+            print(f"   📁 Creating output directory: {output_dir}")
+            
+            # Create figure and axis
+            fig, ax = plt.subplots(1, 1, figsize=(14, 10))
+            ax.set_xlim(0, 10)
+            ax.set_ylim(0, 10)
+            ax.axis('off')
+            
+            # Define colors
+            header_color = '#2E86AB'
+            section_color = '#A23B72'
+            positive_color = '#F18F01'
+            neutral_color = '#C73E1D'
+            
+            # Title
+            title_box = FancyBboxPatch((0.5, 9), 9, 0.8, boxstyle="round,pad=0.1", 
+                                      facecolor=header_color, edgecolor='black', linewidth=2)
+            ax.add_patch(title_box)
+            ax.text(5, 9.4, '🏆 STRATEGY PERFORMANCE EVALUATION', 
+                    fontsize=18, fontweight='bold', ha='center', va='center', color='white')
+            ax.text(5, 9.1, 'Pesaran & Timmermann Multi-Predictor Model (Dividend Yield + CPI)', 
+                    fontsize=12, ha='center', va='center', color='white')
+            
+            # Section 1: Prediction Accuracy
+            y_pos = 8.2
+            section1_box = FancyBboxPatch((0.5, y_pos-0.4), 9, 1.2, boxstyle="round,pad=0.05", 
+                                         facecolor='#E8F4F8', edgecolor=section_color, linewidth=1.5)
+            ax.add_patch(section1_box)
+            ax.text(1, y_pos+0.4, 'PREDICTION ACCURACY', fontsize=14, fontweight='bold', color=section_color)
+            ax.text(1.2, y_pos+0.1, '🎯 Correct predictions:', fontsize=11, color='black')
+            ax.text(7, y_pos+0.1, f"{int(metrics['correct_predictions'])}/{int(metrics['total_predictions'])} ({metrics['accuracy']*100:.1f}%)", 
+                    fontsize=11, fontweight='bold', color=positive_color)
+            
+            win_periods = int(metrics['win_rate'] * metrics['total_predictions'])
+            ax.text(1.2, y_pos-0.1, '🏆 Win periods (outperformed):', fontsize=11, color='black')
+            ax.text(7, y_pos-0.1, f"{win_periods}/{int(metrics['total_predictions'])} ({metrics['win_rate']*100:.1f}%)", 
+                    fontsize=11, fontweight='bold', color=neutral_color)
+            
+            ax.text(1.2, y_pos-0.3, '📊 Average outperformance:', fontsize=11, color='black')
+            ax.text(7, y_pos-0.3, f"{metrics['avg_outperformance']:.2f}% per period", fontsize=11, fontweight='bold', color=positive_color)
+            
+            # Section 2: Strategy Performance
+            y_pos = 6.5
+            section2_box = FancyBboxPatch((0.5, y_pos-0.5), 4.2, 1.4, boxstyle="round,pad=0.05", 
+                                         facecolor='#F0F8E8', edgecolor=section_color, linewidth=1.5)
+            ax.add_patch(section2_box)
+            ax.text(1, y_pos+0.6, 'SWITCHING STRATEGY', fontsize=12, fontweight='bold', color=section_color)
+            ax.text(1.2, y_pos+0.3, '💰 Total return:', fontsize=10, color='black')
+            ax.text(3.8, y_pos+0.3, f"{metrics['switching_total_return']*100:.1f}%", fontsize=10, fontweight='bold', color=positive_color)
+            ax.text(1.2, y_pos+0.1, '📈 Annualized return:', fontsize=10, color='black')
+            ax.text(3.8, y_pos+0.1, f"{metrics['switching_annual_return']*100:.1f}%", fontsize=10, fontweight='bold', color=positive_color)
+            ax.text(1.2, y_pos-0.1, '📊 Volatility:', fontsize=10, color='black')
+            ax.text(3.8, y_pos-0.1, f"{metrics['switching_volatility']*100:.1f}%", fontsize=10, fontweight='bold', color='black')
+            ax.text(1.2, y_pos-0.3, '⚡ Sharpe ratio:', fontsize=10, color='black')
+            ax.text(3.8, y_pos-0.3, f"{metrics['switching_sharpe']:.3f}", fontsize=10, fontweight='bold', color=positive_color)
+            
+            # Section 3: Benchmark Performance
+            section3_box = FancyBboxPatch((5.3, y_pos-0.5), 4.2, 1.4, boxstyle="round,pad=0.05", 
+                                         facecolor='#FFF8E8', edgecolor=section_color, linewidth=1.5)
+            ax.add_patch(section3_box)
+            ax.text(5.8, y_pos+0.6, 'BUY-AND-HOLD BENCHMARK', fontsize=12, fontweight='bold', color=section_color)
+            ax.text(6, y_pos+0.3, '💰 Total return:', fontsize=10, color='black')
+            ax.text(8.6, y_pos+0.3, f"{metrics['buyhold_total_return']*100:.1f}%", fontsize=10, fontweight='bold', color='black')
+            ax.text(6, y_pos+0.1, '📈 Annualized return:', fontsize=10, color='black')
+            ax.text(8.6, y_pos+0.1, f"{metrics['buyhold_annual_return']*100:.1f}%", fontsize=10, fontweight='bold', color='black')
+            ax.text(6, y_pos-0.1, '📊 Volatility:', fontsize=10, color='black')
+            ax.text(8.6, y_pos-0.1, f"{metrics['buyhold_volatility']*100:.1f}%", fontsize=10, fontweight='bold', color='black')
+            ax.text(6, y_pos-0.3, '⚡ Sharpe ratio:', fontsize=10, color='black')
+            ax.text(8.6, y_pos-0.3, f"{metrics['buyhold_sharpe']:.3f}", fontsize=10, fontweight='bold', color='black')
+            
+            # Section 4: Strategy Comparison
+            y_pos = 4.5
+            section4_box = FancyBboxPatch((0.5, y_pos-0.4), 9, 1, boxstyle="round,pad=0.05", 
+                                         facecolor='#E8F8E8', edgecolor=section_color, linewidth=1.5)
+            ax.add_patch(section4_box)
+            ax.text(1, y_pos+0.3, 'STRATEGY COMPARISON', fontsize=14, fontweight='bold', color=section_color)
+            
+            return_advantage = metrics['switching_annual_return'] - metrics['buyhold_annual_return']
+            sharpe_advantage = metrics['switching_sharpe'] - metrics['buyhold_sharpe']
+            
+            ax.text(1.2, y_pos, '🚀 Return advantage:', fontsize=11, color='black')
+            ax.text(4.5, y_pos, f"{return_advantage*100:.1f}%", fontsize=11, fontweight='bold', color=positive_color)
+            ax.text(6, y_pos, '🎯 Sharpe advantage:', fontsize=11, color='black')
+            ax.text(8.5, y_pos, f"{sharpe_advantage:.3f}", fontsize=11, fontweight='bold', color=positive_color)
+            
+            # Section 5: Results Summary
+            y_pos = 3.2
+            section5_box = FancyBboxPatch((0.5, y_pos-0.6), 9, 1.4, boxstyle="round,pad=0.05", 
+                                         facecolor='#F8F8F8', edgecolor=section_color, linewidth=1.5)
+            ax.add_patch(section5_box)
+            ax.text(1, y_pos+0.5, 'ANALYSIS SUMMARY', fontsize=14, fontweight='bold', color=section_color)
+            ax.text(1.2, y_pos+0.2, '💾 Results saved to: SMM265_DivYield_CPI_Strategy_Evaluation_Results.xlsx', fontsize=10, color='black')
+            ax.text(1.2, y_pos, '📅 All dates in date-only format (no timestamps)', fontsize=10, color='black')
+            ax.text(1.2, y_pos-0.2, f"🎉 Rolling window analysis complete: {int(metrics['total_predictions'])} predictions generated", fontsize=10, color='black')
+            ax.text(1.2, y_pos-0.4, '📈 Coefficient evolution demonstrates market adaptability', fontsize=10, color='black')
+            
+            # Success indicator
+            y_pos = 1.5
+            if return_advantage > 0 and sharpe_advantage > 0:
+                success_text = '✅ STRATEGY SUCCESS: Multi-predictor outperformed buy-and-hold'
+                success_color = positive_color
+            else:
+                success_text = '⚠️ MIXED RESULTS: See detailed analysis above'
+                success_color = neutral_color
+                
+            success_box = FancyBboxPatch((2, y_pos-0.4), 6, 0.8, boxstyle="round,pad=0.1", 
+                                        facecolor=success_color, edgecolor='black', linewidth=2)
+            ax.add_patch(success_box)
+            ax.text(5, y_pos, success_text, 
+                    fontsize=12, fontweight='bold', ha='center', va='center', color='white')
+            
+            # Footer
+            ax.text(5, 0.5, 'SMM265 Asset Pricing - Pesaran & Timmermann (1995) Implementation', 
+                    fontsize=10, ha='center', va='center', color='gray', style='italic')
+            
+            plt.tight_layout()
+            
+            # Save the figure
+            filename = output_dir / 'SMM265_DivYield_CPI_Strategy_Performance_Table.png'
+            print(f"   💾 Attempting to save: {filename}")
+            
+            # Ensure the plot doesn't show (which might prevent saving)
+            plt.ioff()  # Turn off interactive mode
+            plt.savefig(filename, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+            plt.close()
+            
+            # Verify file was saved
+            if filename.exists():
+                print(f"\n📊 PERFORMANCE TABLE SAVED:")
+                print(f"   📈 Visual summary: {filename}")
+                print(f"   📏 File size: {filename.stat().st_size} bytes")
+            else:
+                print(f"   ❌ File was not saved to: {filename}")
+                
+        except Exception as e:
+            print(f"   ⚠️ Could not create performance table: {e}")
+            import traceback
+            traceback.print_exc()
+            print(f"   📄 Detailed results available in Excel files")
 
 def main():
-    analyzer = PesaranTimmermannDividendYield()
+    analyzer = PesaranTimmermannMultiPredictor()
     analyzer.run_full_analysis()
 
 if __name__ == "__main__":
