@@ -1282,7 +1282,7 @@ class PesaranTimmermannMultiPredictor:
         plt.axhline(y=0, color='black', linestyle='--', alpha=0.5, linewidth=1)
         
         # Formatting
-        plt.title('Pesaran & Timmermann Model: Predicted vs Actual Excess Returns\n(Rolling Window Predictions 2015-2025)', 
+        plt.title('Plot 1 - Pesaran & Timmermann Model: Predicted vs Actual Excess Returns\n(Rolling Window Predictions 2015-2025)', 
                   fontsize=14, fontweight='bold')
         plt.xlabel('Prediction Date', fontsize=12)
         plt.ylabel('Excess Return (%)', fontsize=12)
@@ -1336,45 +1336,58 @@ class PesaranTimmermannMultiPredictor:
         # Convert prediction_date to datetime for plotting
         plot_data['prediction_date_dt'] = pd.to_datetime(plot_data['prediction_date'])
         
-        # Calculate cumulative returns for both strategies
+        # Calculate cumulative returns for all strategies
         plot_data['switching_cumulative'] = (1 + plot_data['switching_strategy_return']).cumprod()
         plot_data['buyhold_cumulative'] = (1 + plot_data['buyhold_strategy_return']).cumprod()
+        
+        # Calculate InterBank cumulative returns using actual InterBank returns for all periods
+        plot_data['interbank_cumulative'] = (1 + plot_data['actual_interbank_return']).cumprod()
         
         # Create the plot
         plt.figure(figsize=(14, 8))
         
-        # Plot cumulative returns
+        # Plot cumulative returns for all three strategies
         plt.plot(plot_data['prediction_date_dt'], plot_data['switching_cumulative'], 
-                linewidth=3, label='Switching Strategy', color='blue', alpha=0.8)
+                linewidth=3, label='Switching Strategy (Multi-Predictor)', color='blue', alpha=0.8)
         
         plt.plot(plot_data['prediction_date_dt'], plot_data['buyhold_cumulative'], 
-                linewidth=3, label='Buy-and-Hold (FTSE)', color='red', alpha=0.8)
+                linewidth=3, label='Buy-and-Hold (FTSE All Share)', color='red', alpha=0.8)
+        
+        plt.plot(plot_data['prediction_date_dt'], plot_data['interbank_cumulative'], 
+                linewidth=3, label='InterBank Rate (Risk-Free)', color='green', alpha=0.8)
         
         # Add horizontal line at 1.0 (no gain/loss)
         plt.axhline(y=1.0, color='black', linestyle='--', alpha=0.5, linewidth=1)
         
         # Formatting
-        plt.title('Cumulative Returns Dividend Yield & CPI: Switching Strategy vs Buy-and-Hold\n(Pesaran & Timmermann Rolling Window 2015-2025)', 
+        plt.title('Cumulative Returns: Multi-Predictor Switching Strategy vs Benchmarks\n(Dividend Yield + CPI Model vs FTSE Buy-and-Hold vs InterBank Rate)', 
                   fontsize=14, fontweight='bold')
         plt.xlabel('Date', fontsize=12)
         plt.ylabel('Cumulative Return (1 = No Change)', fontsize=12)
-        plt.legend(fontsize=12)
+        plt.legend(fontsize=11)
         plt.grid(True, alpha=0.3)
         
         # Rotate x-axis labels for better readability
         plt.xticks(rotation=45)
         
-        # Add summary statistics as text box
+        # Add summary statistics as text box with all three strategies
         final_switching = plot_data['switching_cumulative'].iloc[-1]
         final_buyhold = plot_data['buyhold_cumulative'].iloc[-1]
+        final_interbank = plot_data['interbank_cumulative'].iloc[-1]
+        
         switching_return = (final_switching - 1) * 100
         buyhold_return = (final_buyhold - 1) * 100
-        outperformance = switching_return - buyhold_return
+        interbank_return = (final_interbank - 1) * 100
+        
+        outperformance_vs_buyhold = switching_return - buyhold_return
+        outperformance_vs_interbank = switching_return - interbank_return
         
         textstr = f'Final Returns:\n'
         textstr += f'Switching Strategy: {switching_return:.1f}%\n'
-        textstr += f'Buy-and-Hold: {buyhold_return:.1f}%\n'
-        textstr += f'Outperformance: {outperformance:.1f}%'
+        textstr += f'Buy-and-Hold (FTSE): {buyhold_return:.1f}%\n'
+        textstr += f'InterBank Rate: {interbank_return:.1f}%\n'
+        textstr += f'Outperformance vs FTSE: {outperformance_vs_buyhold:.1f}%\n'
+        textstr += f'Outperformance vs InterBank: {outperformance_vs_interbank:.1f}%'
         
         props = dict(boxstyle='round', facecolor='lightblue', alpha=0.8)
         plt.text(0.02, 0.98, textstr, transform=plt.gca().transAxes, fontsize=10,
