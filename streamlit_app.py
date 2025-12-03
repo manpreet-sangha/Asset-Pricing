@@ -91,12 +91,23 @@ def load_input_data():
     return data_files
 
 
-def run_analysis(index_data, interbank_data, cpi_data, progress_callback=None):
-    """Run the Pesaran & Timmermann analysis with the provided data"""
-    from forecasting_uk_stock_market_2_webapp import PesaranTimmermannMultiPredictor
+def run_analysis(index_data, interbank_data, cpi_data, analysis_type="option1", progress_callback=None):
+    """Run the Pesaran & Timmermann analysis with the provided data
     
-    # Create predictor instance
-    predictor = PesaranTimmermannMultiPredictor()
+    Args:
+        index_data: FTSE Index data
+        interbank_data: InterBank rate data
+        cpi_data: CPI data
+        analysis_type: "option1" for standard analysis, "option2" for lag selection
+        progress_callback: Progress update callback function
+    """
+    from forecasting_uk_stock_market_2_webapp import PesaranTimmermannMultiPredictor, DividendYieldLagSelectionAnalysis
+    
+    # Create predictor instance based on analysis type
+    if analysis_type == "option2":
+        predictor = DividendYieldLagSelectionAnalysis()
+    else:
+        predictor = PesaranTimmermannMultiPredictor()
     
     # Set data directly instead of loading from files
     predictor.set_input_data(index_data, interbank_data, cpi_data)
@@ -116,7 +127,12 @@ def run_analysis(index_data, interbank_data, cpi_data, progress_callback=None):
     
     if progress_callback:
         progress_callback(0.5, "Running rolling window predictions...")
-    predictor.rolling_window_predictions()
+    
+    # Run appropriate prediction method based on analysis type
+    if analysis_type == "option2":
+        predictor.rolling_window_predictions_with_lags()
+    else:
+        predictor.rolling_window_predictions()
     
     if progress_callback:
         progress_callback(0.8, "Generating visualizations...")
@@ -134,10 +150,11 @@ def run_analysis(index_data, interbank_data, cpi_data, progress_callback=None):
     if fig2:
         plots['cumulative_returns'] = fig2
     
-    # Plot 3: PT Test Table
-    fig3 = predictor.create_pt_test_table_webapp()
-    if fig3:
-        plots['pt_test_table'] = fig3
+    # Plot 3: PT Test Table (only for Option 1)
+    if analysis_type == "option1":
+        fig3 = predictor.create_pt_test_table_webapp()
+        if fig3:
+            plots['pt_test_table'] = fig3
     
     # Plot 4: Predictions Table
     fig4 = predictor.create_pt_predictions_table_webapp()
@@ -151,7 +168,8 @@ def run_analysis(index_data, interbank_data, cpi_data, progress_callback=None):
         'predictor': predictor,
         'plots': plots,
         'rolling_predictions': predictor.rolling_predictions if hasattr(predictor, 'rolling_predictions') else None,
-        'performance_metrics': predictor.performance_metrics if hasattr(predictor, 'performance_metrics') else None
+        'performance_metrics': predictor.performance_metrics if hasattr(predictor, 'performance_metrics') else None,
+        'analysis_type': analysis_type
     }
 
 
@@ -227,14 +245,39 @@ def main():
         st.header("Run Analysis")
         
         if all_data_available:
-            st.info("""
-            **Analysis Steps:**
-            1. Merge input data (Index, InterBank Rate, CPI)
-            2. Compute 6-month returns and excess returns
-            3. Train multi-predictor model using rolling windows
-            4. Generate predictions and evaluate performance
-            5. Create visualizations and summary tables
-            """)
+            # Analysis Type Selection
+            st.subheader("📋 Select Analysis Type")
+            
+            analysis_option = st.radio(
+                "Choose the analysis method:",
+                options=["option1", "option2"],
+                format_func=lambda x: "Option 1: Standard Analysis (Current DY + CPI)" if x == "option1" else "Option 2: Lag Selection Analysis (Optimal DY + CPI Lags)",
+                horizontal=True,
+                help="Option 1 uses current dividend yield and CPI. Option 2 tests multiple lags and selects optimal ones."
+            )
+            
+            if analysis_option == "option1":
+                st.info("""
+                **Option 1 - Standard Analysis Steps:**
+                1. Merge input data (Index, InterBank Rate, CPI)
+                2. Compute 6-month returns and excess returns
+                3. Train model using **current** dividend yield and CPI
+                4. Generate predictions using rolling windows
+                5. Create visualizations and summary tables
+                """)
+            else:
+                st.info("""
+                **Option 2 - Lag Selection Analysis Steps:**
+                1. Merge input data (Index, InterBank Rate, CPI)
+                2. Compute 6-month returns and excess returns
+                3. **For each prediction window:**
+                   - Test DY lags (0, 1, 2, 3 months) → Select best by |t-statistic|
+                   - Given optimal DY lag, test CPI lags (0, 1, 2 months) → Select best by |t-statistic|
+                4. Generate predictions using rolling windows with **optimal lags**
+                5. Create visualizations and summary tables with lag information
+                """)
+            
+            st.divider()
             
             # Initialize session state for results
             if 'analysis_results' not in st.session_state:
@@ -259,16 +302,19 @@ def main():
                     output_capture = io.StringIO()
                     
                     try:
-                        # Run the analysis
+                        # Run the analysis with selected option
                         results = run_analysis(
                             data_files['index']['data'],
                             data_files['interbank']['data'],
                             data_files['cpi']['data'],
+                            analysis_type=analysis_option,
                             progress_callback=update_progress
                         )
                         
                         st.session_state.analysis_results = results
-                        st.success("✅ Analysis completed successfully!")
+                        
+                        option_name = "Standard Analysis" if analysis_option == "option1" else "Lag Selection Analysis"
+                        st.success(f"✅ {option_name} completed successfully!")
                         
                     except Exception as e:
                         st.error(f"❌ Error running analysis: {str(e)}")
@@ -287,6 +333,13 @@ def main():
         
         if st.session_state.get('analysis_results'):
             results = st.session_state.analysis_results
+            
+            # Show which analysis type was run
+            analysis_type = results.get('analysis_type', 'option1')
+            if analysis_type == "option2":
+                st.info("📊 **Lag Selection Analysis Results** - Using optimal DY and CPI lags per iteration")
+            else:
+                st.info("📊 **Standard Analysis Results** - Using current dividend yield and CPI")
             
             # Performance Metrics Summary
             if results.get('performance_metrics'):
@@ -382,8 +435,39 @@ def main():
         
         Where:
         - **Excess_Return** = FTSE All-Share 6-month return - InterBank 6-month return
-        - **Dividend_Yield** = Current dividend yield of FTSE All-Share
-        - **CPI_Growth** = UK Consumer Price Index year-over-year growth rate
+        - **Dividend_Yield** = Dividend yield of FTSE All-Share (current or lagged)
+        - **CPI_Growth** = UK Consumer Price Index year-over-year growth rate (current or lagged)
+        
+        ---
+        
+        ### Option 1: Standard Analysis
+        
+        Uses **current** values of both predictors:
+        - Dividend Yield: Current month
+        - CPI Growth: Current month
+        
+        ---
+        
+        ### Option 2: Lag Selection Analysis
+        
+        Implements **sequential lag selection** following Pesaran & Timmermann methodology:
+        
+        **Step 1 - Select Optimal DY Lag:**
+        - Test lags: 0, 1, 2, 3 months
+        - Selection criterion: Highest absolute t-statistic for β₁
+        
+        **Step 2 - Select Optimal CPI Lag:**
+        - Given optimal DY lag from Step 1
+        - Test lags: 0, 1, 2 months
+        - Selection criterion: Highest absolute t-statistic for β₂
+        
+        **Step 3 - Make Prediction:**
+        - Use final model with both optimal lags
+        - Generate 6-month ahead forecast
+        
+        This process repeats for **each prediction window**, allowing optimal lags to vary over time.
+        
+        ---
         
         ### Rolling Window Approach
         

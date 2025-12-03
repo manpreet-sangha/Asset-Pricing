@@ -4,6 +4,11 @@ Pesaran & Timmermann Multi-Predictor Model - Webapp Version
 This is a modified version of forecasting_uk_stock_market_2.py designed to work
 with Streamlit webapp. It accepts data directly instead of reading from files.
 
+This version implements Option 2: Dividend Yield Lag Selection Analysis
+- Tests multiple dividend yield lags (0, 1, 2, 3 months) per iteration
+- Tests multiple CPI lags (0, 1, 2 months) per iteration  
+- Selects optimal lags based on t-statistics
+
 Original file: forecasting_uk_stock_market_2.py (unchanged)
 """
 
@@ -847,6 +852,527 @@ class PesaranTimmermannMultiPredictor:
                     table[(i, j)].set_facecolor('#FFFFFF')
                 
                 if j == 5:
+                    if table_rows[i-1][j] == "✓":
+                        table[(i, j)].set_facecolor('#D4F6D4')
+                    else:
+                        table[(i, j)].set_facecolor('#F6D4D4')
+        
+        correct_predictions = table_data['prediction_correct'].sum()
+        total_predictions = len(table_data)
+        accuracy = correct_predictions / total_predictions * 100
+        
+        summary_text = f"{correct_predictions}/{total_predictions} correct ({accuracy:.1f}%)"
+        fig.text(0.5, 0.03, summary_text, ha='center', fontsize=9, fontweight='bold')
+        
+        plt.tight_layout(rect=[0, 0.02, 1, 0.96])
+        
+        return fig
+
+
+class DividendYieldLagSelectionAnalysis(PesaranTimmermannMultiPredictor):
+    """
+    Enhanced class that selects optimal lags for both dividend yield and CPI using sequential approach:
+    Step 1: Find optimal dividend yield lag (test lags 0, 1, 2, 3)
+    Step 2: Given optimal DY lag, find optimal CPI lag (test lags 0, 1, 2)
+    
+    This follows Pesaran & Timmermann (1995) lag selection methodology
+    Webapp version - accepts data directly instead of reading from files
+    """
+    
+    def __init__(self):
+        super().__init__()
+        self.lag_selection_results = []
+        self.cpi_lag_selection_results = []
+        self.min_training_obs = 200
+        
+    def prepare_lagged_data(self):
+        """Add lagged dividend yield AND CPI columns for sequential lag selection"""
+        print("\n📅 PREPARING LAGGED DIVIDEND YIELD AND CPI DATA")
+        print("="*60)
+        
+        if not hasattr(self, 'data') or self.data is None:
+            print("   ❌ No data available")
+            return False
+            
+        self.data = self.data.sort_values('Date').copy()
+        
+        # Add lagged dividend yields (0, 1, 2, 3 months)
+        self.data['dividend_yield_lag0'] = self.data['dividend_yield']
+        self.data['dividend_yield_lag1'] = self.data['dividend_yield'].shift(1)
+        self.data['dividend_yield_lag2'] = self.data['dividend_yield'].shift(2)
+        self.data['dividend_yield_lag3'] = self.data['dividend_yield'].shift(3)
+        
+        # Add lagged CPI columns (0, 1, 2 months)
+        self.data['cpi_yoy_lag0'] = self.data['cpi_yoy']
+        self.data['cpi_yoy_lag1'] = self.data['cpi_yoy'].shift(1)
+        self.data['cpi_yoy_lag2'] = self.data['cpi_yoy'].shift(2)
+        
+        # Update full_data as well
+        self.full_data = self.data.copy()
+        
+        print(f"   ✅ Lagged data prepared")
+        print(f"   📊 DY lags: 0, 1, 2, 3 months")
+        print(f"   📊 CPI lags: 0, 1, 2 months")
+        
+        return True
+
+    def get_prediction_dates(self):
+        """Generate prediction dates for rolling window analysis"""
+        self.prediction_dates = []
+        start_date = pd.Timestamp('2015-10-01')
+        end_date = self.data['Date'].max() - pd.DateOffset(months=6)
+        
+        current_date = start_date
+        while current_date <= end_date:
+            self.prediction_dates.append(current_date)
+            current_date += pd.DateOffset(months=6)
+            
+        print(f"   📅 Prediction dates: {len(self.prediction_dates)} periods")
+
+    def test_dividend_yield_lags(self, training_data, iteration_info):
+        """Test multiple dividend yield lags and select best based on t-statistics"""
+        lag_test_results = []
+        
+        for lag in range(4):
+            lag_desc = "Current" if lag == 0 else f"{lag}-Month Lag"
+            div_yield_col = f'dividend_yield_lag{lag}'
+            
+            if div_yield_col not in training_data.columns:
+                continue
+                
+            temp_data = training_data.dropna(subset=[div_yield_col, 'cpi_yoy', 'excess_return']).copy()
+            
+            if len(temp_data) < 50:
+                continue
+            
+            try:
+                X = temp_data[[div_yield_col, 'cpi_yoy']]
+                y = temp_data['excess_return']
+                X_with_const = sm.add_constant(X)
+                model = sm.OLS(y, X_with_const).fit()
+                
+                lag_result = {
+                    'lag': lag,
+                    'lag_description': lag_desc,
+                    'div_yield_column': div_yield_col,
+                    'training_observations': len(temp_data),
+                    'alpha_hat': model.params.iloc[0],
+                    'beta1_hat': model.params.iloc[1],
+                    'beta2_hat': model.params.iloc[2],
+                    'beta1_t_stat': model.tvalues.iloc[1],
+                    'beta2_t_stat': model.tvalues.iloc[2],
+                    'r_squared': model.rsquared,
+                    'adj_r_squared': model.rsquared_adj,
+                    'model': model
+                }
+                lag_test_results.append(lag_result)
+                
+            except Exception as e:
+                continue
+        
+        if not lag_test_results:
+            return None
+            
+        # Select best lag based on highest absolute t-statistic for dividend yield
+        best_lag = max(lag_test_results, key=lambda x: abs(x['beta1_t_stat']))
+        
+        return {
+            'iteration_info': iteration_info,
+            'lag_tests': lag_test_results,
+            'selected_lag': best_lag
+        }
+
+    def test_cpi_lags(self, training_data, iteration_info, selected_dy_lag):
+        """Test multiple CPI lags given the selected DY lag"""
+        cpi_lag_test_results = []
+        div_yield_col = f'dividend_yield_lag{selected_dy_lag}'
+        
+        for cpi_lag in range(3):
+            cpi_lag_desc = "Current" if cpi_lag == 0 else f"{cpi_lag}-Month Lag"
+            cpi_col = f'cpi_yoy_lag{cpi_lag}'
+            
+            if cpi_col not in training_data.columns:
+                continue
+                
+            temp_data = training_data.dropna(subset=[div_yield_col, cpi_col, 'excess_return']).copy()
+            
+            if len(temp_data) < 50:
+                continue
+            
+            try:
+                X = temp_data[[div_yield_col, cpi_col]]
+                y = temp_data['excess_return']
+                X_with_const = sm.add_constant(X)
+                model = sm.OLS(y, X_with_const).fit()
+                
+                pred_date = pd.to_datetime(iteration_info['prediction_date'])
+                if cpi_lag == 0:
+                    cpi_date = (pred_date - pd.DateOffset(months=1)).strftime('%Y-%m')
+                else:
+                    cpi_date = (pred_date - pd.DateOffset(months=cpi_lag+1)).strftime('%Y-%m')
+                
+                cpi_result = {
+                    'cpi_lag': cpi_lag,
+                    'cpi_lag_description': cpi_lag_desc,
+                    'cpi_column': cpi_col,
+                    'div_yield_column': div_yield_col,
+                    'cpi_date': cpi_date,
+                    'training_observations': len(temp_data),
+                    'alpha_hat': model.params.iloc[0],
+                    'beta1_hat': model.params.iloc[1],
+                    'beta2_hat': model.params.iloc[2],
+                    'beta1_t_stat': model.tvalues.iloc[1],
+                    'beta2_t_stat': model.tvalues.iloc[2],
+                    'r_squared': model.rsquared,
+                    'adj_r_squared': model.rsquared_adj,
+                    'model': model
+                }
+                cpi_lag_test_results.append(cpi_result)
+                
+            except Exception as e:
+                continue
+        
+        if not cpi_lag_test_results:
+            return None
+            
+        # Select best CPI lag based on highest absolute t-statistic
+        best_cpi_lag = max(cpi_lag_test_results, key=lambda x: abs(x['beta2_t_stat']))
+        
+        return {
+            'iteration_info': iteration_info,
+            'cpi_lag_tests': cpi_lag_test_results,
+            'selected_cpi_lag': best_cpi_lag
+        }
+
+    def rolling_window_predictions_with_lags(self):
+        """Implement rolling window prediction with lag selection"""
+        print("\n🔮 ROLLING WINDOW PREDICTION WITH LAG SELECTION")
+        print("="*60)
+        
+        # Prepare lagged data
+        if not self.prepare_lagged_data():
+            return None
+        
+        # Get prediction dates
+        self.get_prediction_dates()
+        
+        final_predictions = []
+        self.lag_selection_results = []
+        self.cpi_lag_selection_results = []
+        
+        for i, prediction_date in enumerate(self.prediction_dates):
+            print(f"\n📅 Iteration {i+1}/{len(self.prediction_dates)}: {prediction_date.strftime('%Y-%m-%d')}")
+            
+            # Get training data
+            training_end_date = prediction_date - pd.DateOffset(days=1)
+            training_start_dt = pd.to_datetime(self.training_start)
+            training_data = self.data[(self.data['Date'] >= training_start_dt) & 
+                                      (self.data['Date'] <= training_end_date)].copy()
+            
+            if len(training_data) < self.min_training_obs:
+                print(f"   ⚠️ Insufficient training data ({len(training_data)} obs)")
+                continue
+            
+            # Compute excess returns for training data
+            training_data['ftse_6m_return'] = training_data['ftse_price'].pct_change(6).shift(-6)
+            training_data['interbank_6m_return'] = ((1 + training_data['m_interbank_rate']/100) ** 0.5) - 1
+            training_data['excess_return'] = training_data['ftse_6m_return'] - training_data['interbank_6m_return'].shift(-6)
+            training_data = training_data.dropna(subset=['excess_return'])
+            
+            iteration_info = {
+                'prediction_date': prediction_date,
+                'iteration': i + 1,
+                'training_start': training_data['Date'].min(),
+                'training_end': training_end_date
+            }
+            
+            # Step 1: Test DY lags
+            dy_lag_result = self.test_dividend_yield_lags(training_data, iteration_info)
+            if dy_lag_result is None:
+                continue
+            
+            selected_dy_lag = dy_lag_result['selected_lag']['lag']
+            self.lag_selection_results.append(dy_lag_result)
+            
+            # Step 2: Test CPI lags
+            cpi_lag_result = self.test_cpi_lags(training_data, iteration_info, selected_dy_lag)
+            if cpi_lag_result is None:
+                continue
+            
+            selected_cpi_lag = cpi_lag_result['selected_cpi_lag']['cpi_lag']
+            self.cpi_lag_selection_results.append(cpi_lag_result)
+            
+            # Step 3: Make prediction
+            final_model = cpi_lag_result['selected_cpi_lag']['model']
+            selected_dy_info = dy_lag_result['selected_lag']
+            selected_cpi_info = cpi_lag_result['selected_cpi_lag']
+            
+            # Get predictor values
+            pred_date = pd.to_datetime(prediction_date)
+            target_date = pred_date - pd.DateOffset(months=1)
+            date_diffs = (self.data['Date'] - target_date).abs()
+            closest_idx = date_diffs.idxmin()
+            predictor_row = self.data.loc[closest_idx]
+            
+            div_yield_value = predictor_row[selected_cpi_info['div_yield_column']]
+            cpi_value = predictor_row[selected_cpi_info['cpi_column']]
+            
+            # Make prediction
+            X_pred = pd.DataFrame([[1, div_yield_value, cpi_value]], 
+                                 columns=['const', selected_cpi_info['div_yield_column'], selected_cpi_info['cpi_column']])
+            predicted_excess_return = final_model.predict(X_pred)[0]
+            
+            invest_in_stocks = 1 if predicted_excess_return > 0 else 0
+            investment_decision = "FTSE All Share Index" if invest_in_stocks else "Interbank Rate"
+            
+            print(f"   ✅ DY Lag: {selected_dy_lag}, CPI Lag: {selected_cpi_lag}")
+            print(f"   📈 Prediction: {predicted_excess_return:.4f} → {investment_decision}")
+            
+            # Calculate actual returns
+            actual_returns = self.calculate_actual_returns_for_lag_prediction(prediction_date, invest_in_stocks, predicted_excess_return)
+            
+            if actual_returns is None:
+                continue
+            
+            prediction_result = {
+                'iteration': i + 1,
+                'prediction_date': prediction_date.date(),
+                'training_start': training_start_dt.date(),
+                'training_end': training_end_date.date(),
+                'training_observations': len(training_data),
+                'selected_dy_lag': selected_dy_lag,
+                'selected_cpi_lag': selected_cpi_lag,
+                'alpha_hat': selected_cpi_info['alpha_hat'],
+                'beta1_hat': selected_cpi_info['beta1_hat'],
+                'beta2_hat': selected_cpi_info['beta2_hat'],
+                'r_squared': selected_cpi_info['r_squared'],
+                'dividend_yield': div_yield_value,
+                'cpi_growth': cpi_value,
+                'predicted_excess_return': predicted_excess_return,
+                'invest_in_stocks': invest_in_stocks,
+                'investment_decision': investment_decision,
+                **actual_returns
+            }
+            
+            final_predictions.append(prediction_result)
+        
+        if len(final_predictions) == 0:
+            print("❌ No successful predictions generated")
+            return None
+        
+        self.rolling_predictions = pd.DataFrame(final_predictions)
+        
+        # Calculate performance metrics
+        self.calculate_strategy_performance_metrics(self.rolling_predictions)
+        
+        print(f"\n📊 LAG SELECTION SUMMARY:")
+        print(f"   Total predictions: {len(self.rolling_predictions)}")
+        print(f"   Stock investments: {self.rolling_predictions['invest_in_stocks'].sum()}")
+        
+        return self.rolling_predictions
+
+    def calculate_actual_returns_for_lag_prediction(self, prediction_date, invest_in_stocks, predicted_excess_return):
+        """Calculate actual returns for a prediction date"""
+        try:
+            start_date = prediction_date
+            end_date = prediction_date + pd.DateOffset(months=6)
+            
+            start_data = self.data[self.data['Date'] <= start_date].iloc[-1]
+            end_data_candidates = self.data[self.data['Date'] >= end_date]
+            
+            if len(end_data_candidates) == 0:
+                return None
+                
+            end_data = end_data_candidates.iloc[0]
+            
+            ftse_return = (end_data['ftse_price'] / start_data['ftse_price']) - 1
+            interbank_return = ((1 + end_data['m_interbank_rate']/100) ** (6/12)) - 1
+            excess_return = ftse_return - interbank_return
+            
+            switching_return = ftse_return if invest_in_stocks == 1 else interbank_return
+            buyhold_return = ftse_return
+            
+            prediction_correct = (predicted_excess_return > 0) == (excess_return > 0)
+            
+            return {
+                'actual_ftse_return': ftse_return,
+                'actual_interbank_return': interbank_return,
+                'actual_excess_return': excess_return,
+                'switching_strategy_return': switching_return,
+                'buyhold_strategy_return': buyhold_return,
+                'prediction_correct': prediction_correct,
+                'strategy_outperformance': switching_return - buyhold_return
+            }
+            
+        except Exception as e:
+            print(f"   ❌ Error calculating returns: {e}")
+            return None
+
+    def plot_predicted_vs_actual_returns_webapp(self):
+        """Create time-series chart with lag info - returns figure for webapp display"""
+        if not hasattr(self, 'rolling_predictions') or len(self.rolling_predictions) == 0:
+            return None
+        
+        plot_data = self.rolling_predictions.dropna(subset=['actual_excess_return']).copy()
+        
+        if len(plot_data) == 0:
+            return None
+        
+        plot_data['prediction_date_dt'] = pd.to_datetime(plot_data['prediction_date'])
+        
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        ax.plot(plot_data['prediction_date_dt'], plot_data['predicted_excess_return']*100, 
+                marker='o', linewidth=2, markersize=6, label='Predicted Excess Return', color='blue', alpha=0.8)
+        
+        ax.plot(plot_data['prediction_date_dt'], plot_data['actual_excess_return']*100, 
+                marker='s', linewidth=2, markersize=6, label='Actual Excess Return', color='red', alpha=0.8)
+        
+        ax.axhline(y=0, color='black', linestyle='--', alpha=0.5, linewidth=1)
+        
+        ax.set_title('Pesaran & Timmermann Model with Lag Selection:\nPredicted vs Actual Excess Returns (2015-2025)', 
+                     fontsize=14, fontweight='bold')
+        ax.set_xlabel('Prediction Date', fontsize=12)
+        ax.set_ylabel('Excess Return (%)', fontsize=12)
+        ax.legend(fontsize=11)
+        ax.grid(True, alpha=0.3)
+        
+        plt.xticks(rotation=45)
+        
+        correct_predictions = plot_data['prediction_correct'].sum()
+        total_predictions = len(plot_data)
+        accuracy = correct_predictions / total_predictions * 100
+        
+        # Calculate average lags used
+        avg_dy_lag = plot_data['selected_dy_lag'].mean()
+        avg_cpi_lag = plot_data['selected_cpi_lag'].mean()
+        
+        textstr = f'Prediction Accuracy: {correct_predictions}/{total_predictions} ({accuracy:.1f}%)\n'
+        textstr += f'Avg DY Lag: {avg_dy_lag:.1f} months\n'
+        textstr += f'Avg CPI Lag: {avg_cpi_lag:.1f} months'
+        
+        props = dict(boxstyle='round', facecolor='wheat', alpha=0.8)
+        ax.text(0.02, 0.98, textstr, transform=ax.transAxes, fontsize=10,
+                verticalalignment='top', bbox=props)
+        
+        plt.tight_layout()
+        
+        return fig
+
+    def plot_cumulative_returns_chart_webapp(self):
+        """Create cumulative returns chart - returns figure for webapp display"""
+        if not hasattr(self, 'rolling_predictions') or len(self.rolling_predictions) == 0:
+            return None
+        
+        plot_data = self.rolling_predictions.dropna(subset=['actual_excess_return']).copy()
+        
+        if len(plot_data) == 0:
+            return None
+        
+        plot_data['prediction_date_dt'] = pd.to_datetime(plot_data['prediction_date'])
+        
+        plot_data['switching_cumulative'] = (1 + plot_data['switching_strategy_return']).cumprod()
+        plot_data['buyhold_cumulative'] = (1 + plot_data['buyhold_strategy_return']).cumprod()
+        plot_data['interbank_cumulative'] = (1 + plot_data['actual_interbank_return']).cumprod()
+        
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        ax.plot(plot_data['prediction_date_dt'], plot_data['switching_cumulative'], 
+                linewidth=3, label='Switching Strategy (Lag Selection)', color='blue', alpha=0.8)
+        
+        ax.plot(plot_data['prediction_date_dt'], plot_data['buyhold_cumulative'], 
+                linewidth=3, label='Buy-and-Hold (FTSE All Share)', color='red', alpha=0.8)
+        
+        ax.plot(plot_data['prediction_date_dt'], plot_data['interbank_cumulative'], 
+                linewidth=3, label='InterBank Rate (Risk-Free)', color='green', alpha=0.8)
+        
+        ax.axhline(y=1.0, color='black', linestyle='--', alpha=0.5, linewidth=1)
+        
+        ax.set_title('Cumulative Returns: Lag Selection Strategy vs Benchmarks\n(Optimal DY + CPI Lags per Iteration)', 
+                     fontsize=14, fontweight='bold')
+        ax.set_xlabel('Date', fontsize=12)
+        ax.set_ylabel('Cumulative Return (1 = No Change)', fontsize=12)
+        ax.legend(fontsize=11)
+        ax.grid(True, alpha=0.3)
+        
+        plt.xticks(rotation=45)
+        
+        final_switching = plot_data['switching_cumulative'].iloc[-1]
+        final_buyhold = plot_data['buyhold_cumulative'].iloc[-1]
+        final_interbank = plot_data['interbank_cumulative'].iloc[-1]
+        
+        switching_return = (final_switching - 1) * 100
+        buyhold_return = (final_buyhold - 1) * 100
+        interbank_return = (final_interbank - 1) * 100
+        
+        textstr = f'Final Returns:\n'
+        textstr += f'Switching: {switching_return:.1f}%\n'
+        textstr += f'Buy-Hold: {buyhold_return:.1f}%\n'
+        textstr += f'InterBank: {interbank_return:.1f}%'
+        
+        props = dict(boxstyle='round', facecolor='lightblue', alpha=0.8)
+        ax.text(0.02, 0.98, textstr, transform=ax.transAxes, fontsize=10,
+                verticalalignment='top', bbox=props)
+        
+        plt.tight_layout()
+        
+        return fig
+
+    def create_pt_predictions_table_webapp(self):
+        """Create predictions vs actual table with lag info - returns figure for webapp display"""
+        if not hasattr(self, 'rolling_predictions') or len(self.rolling_predictions) == 0:
+            return None
+        
+        table_data = self.rolling_predictions.dropna(subset=['actual_excess_return']).copy()
+        
+        if len(table_data) == 0:
+            return None
+        
+        num_rows = len(table_data)
+        fig, ax = plt.subplots(figsize=(10, max(4, num_rows * 0.22 + 1.5)))
+        ax.axis('off')
+        
+        title = "Predictions vs Actual Results\nWith Lag Selection (DY + CPI Lags)"
+        fig.suptitle(title, fontsize=11, fontweight='bold', y=0.97)
+        
+        table_rows = []
+        headers = ['#', 'Date', 'DY Lag', 'CPI Lag', 'Pred (%)', 'Actual (%)', 'Decision', '✓/✗']
+        
+        for idx, row in table_data.iterrows():
+            period = len(table_rows) + 1
+            date = pd.to_datetime(row['prediction_date']).strftime('%Y-%m')
+            dy_lag = str(int(row['selected_dy_lag']))
+            cpi_lag = str(int(row['selected_cpi_lag']))
+            pred_return = f"{row['predicted_excess_return']*100:.1f}"
+            actual_return = f"{row['actual_excess_return']*100:.1f}"
+            investment = "FTSE" if "FTSE" in row['investment_decision'] else "IB"
+            pred_correct = "✓" if row['prediction_correct'] else "✗"
+            
+            table_rows.append([str(period), date, dy_lag, cpi_lag, pred_return, actual_return, investment, pred_correct])
+        
+        table = ax.table(cellText=table_rows,
+                        colLabels=headers,
+                        colWidths=[0.05, 0.12, 0.08, 0.08, 0.10, 0.10, 0.08, 0.05],
+                        cellLoc='center',
+                        loc='center',
+                        bbox=[0.10, 0.08, 0.80, 0.82])
+        
+        table.auto_set_font_size(False)
+        table.set_fontsize(8)
+        table.scale(1, 1.3)
+        
+        for i in range(len(headers)):
+            table[(0, i)].set_facecolor('#4472C4')
+            table[(0, i)].set_text_props(weight='bold', color='white')
+        
+        for i in range(1, len(table_rows) + 1):
+            for j in range(len(headers)):
+                if i % 2 == 0:
+                    table[(i, j)].set_facecolor('#F2F2F2')
+                else:
+                    table[(i, j)].set_facecolor('#FFFFFF')
+                
+                if j == 7:
                     if table_rows[i-1][j] == "✓":
                         table[(i, j)].set_facecolor('#D4F6D4')
                     else:
