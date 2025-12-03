@@ -423,7 +423,7 @@ def main():
         st.header("Methodology")
         
         st.markdown("""
-        ## Pesaran & Timmermann (1995) Multi-Predictor Model
+        ## Pesaran & Timmermann (1994) Multi-Predictor Model
         
         ### Model Specification
         
@@ -435,8 +435,8 @@ def main():
         
         Where:
         - **Excess_Return** = FTSE All-Share 6-month return - InterBank 6-month return
-        - **Dividend_Yield** = Dividend yield of FTSE All-Share (current or lagged)
-        - **CPI_Growth** = UK Consumer Price Index year-over-year growth rate (current or lagged)
+        - **Dividend_Yield** = Dividend yield of FTSE All-Share (current or lagged(0,1,2,3))
+        - **CPI_Growth** = UK Consumer Price Index year-over-year growth rate (current or lagged(0,1,2))
         
         ---
         
