@@ -67,7 +67,8 @@ def load_input_data():
     file_mappings = {
         'index': ('SMM265_Index_DivYield_Monthly.xlsx', 'FTSE Index & Dividend Yield'),
         'interbank': ('SMM265_UK_InterBank_Rate_Monthly.xlsx', 'UK InterBank Rate'),
-        'cpi': ('SMM265 - UKRPCJYR Index - UK CPI YoY - Monthly.xlsx', 'UK CPI Year-over-Year')
+        'cpi': ('SMM265 - UKRPCJYR Index - UK CPI YoY - Monthly.xlsx', 'UK CPI Year-over-Year'),
+        'ip': ('SMM265 - UKIPIYOY Index - UK IP YoY - Monthly.xlsx', 'UK Industrial Production YoY')
     }
     
     for key, (filename, display_name) in file_mappings.items():
@@ -91,26 +92,32 @@ def load_input_data():
     return data_files
 
 
-def run_analysis(index_data, interbank_data, cpi_data, analysis_type="option1", progress_callback=None):
+def run_analysis(index_data, interbank_data, cpi_data, analysis_type="option1", ip_data=None, progress_callback=None):
     """Run the Pesaran & Timmermann analysis with the provided data
     
     Args:
         index_data: FTSE Index data
         interbank_data: InterBank rate data
         cpi_data: CPI data
-        analysis_type: "option1" for standard analysis, "option2" for lag selection
+        analysis_type: "option1" for standard, "option2" for 2-predictor lag selection, "option3" for 3-predictor
+        ip_data: Industrial Production data (required for option3)
         progress_callback: Progress update callback function
     """
-    from forecasting_uk_stock_market_2_webapp import PesaranTimmermannMultiPredictor, DividendYieldLagSelectionAnalysis
+    from forecasting_uk_stock_market_2_webapp import PesaranTimmermannMultiPredictor, DividendYieldLagSelectionAnalysis, ThreePredictorLagSelectionAnalysis
     
     # Create predictor instance based on analysis type
-    if analysis_type == "option2":
+    if analysis_type == "option3":
+        predictor = ThreePredictorLagSelectionAnalysis()
+    elif analysis_type == "option2":
         predictor = DividendYieldLagSelectionAnalysis()
     else:
         predictor = PesaranTimmermannMultiPredictor()
     
     # Set data directly instead of loading from files
-    predictor.set_input_data(index_data, interbank_data, cpi_data)
+    if analysis_type == "option3" and ip_data is not None:
+        predictor.set_input_data_with_ip(index_data, interbank_data, cpi_data, ip_data)
+    else:
+        predictor.set_input_data(index_data, interbank_data, cpi_data)
     
     # Run the analysis steps
     if progress_callback:
@@ -129,7 +136,7 @@ def run_analysis(index_data, interbank_data, cpi_data, analysis_type="option1", 
         progress_callback(0.5, "Running rolling window predictions...")
     
     # Run appropriate prediction method based on analysis type
-    if analysis_type == "option2":
+    if analysis_type == "option3" or analysis_type == "option2":
         predictor.rolling_window_predictions_with_lags()
     else:
         predictor.rolling_window_predictions()
@@ -177,7 +184,7 @@ def main():
     # Header
     st.markdown('<p class="main-header">SMM265 Asset Pricing Coursework</p>', unsafe_allow_html=True)
     st.markdown('<p class="sub-header">Group 7 - Question 1</p>', unsafe_allow_html=True)
-    st.markdown('<p class="sub-header">📈 Pesaran & Timmermann Multi-Predictor Model<br>UK Stock Market Forecasting using Dividend Yield and CPI</p>', unsafe_allow_html=True)
+    st.markdown('<p class="sub-header">📈 Pesaran & Timmermann Multi-Predictor Model<br>UK Stock Market Forecasting using Dividend Yield, CPI, and Industrial Production</p>', unsafe_allow_html=True)
     
     # Sidebar
     st.sidebar.title("🔧 Control Panel")
@@ -186,21 +193,28 @@ def main():
     st.sidebar.subheader("📁 Input Data")
     data_files = load_input_data()
     
-    # Check if all data is available
-    all_data_available = all(data_files.get(key) is not None for key in ['index', 'interbank', 'cpi'])
+    # Check if all data is available (base data for options 1 & 2)
+    base_data_available = all(data_files.get(key) is not None for key in ['index', 'interbank', 'cpi'])
+    # Check if IP data is also available (for option 3)
+    ip_data_available = data_files.get('ip') is not None
+    all_data_available = base_data_available and ip_data_available
     
     if all_data_available:
-        st.sidebar.success("✅ All input files loaded successfully!")
-        
-        # Show data sources
-        for key, info in data_files.items():
-            if info:
-                st.sidebar.text(f"• {info['name']}: {info['source']}")
+        st.sidebar.success("✅ All input files loaded (including IP)!")
+    elif base_data_available:
+        st.sidebar.success("✅ Base input files loaded!")
+        if not ip_data_available:
+            st.sidebar.warning("⚠️ IP data not available - Option 3 disabled")
     else:
         st.sidebar.warning("⚠️ Some input files are missing")
-        missing = [key for key in ['index', 'interbank', 'cpi'] if data_files.get(key) is None]
+        missing = [key for key in ['index', 'interbank', 'cpi', 'ip'] if data_files.get(key) is None]
         for key in missing:
             st.sidebar.error(f"❌ Missing: {key}")
+    
+    # Show data sources
+    for key, info in data_files.items():
+        if info:
+            st.sidebar.text(f"• {info['name']}: ✓")
     
     # Main content area with tabs
     tab1, tab2, tab3, tab4 = st.tabs(["📊 Input Data", "▶️ Run Analysis", "📈 Results", "📋 Methodology"])
@@ -209,26 +223,37 @@ def main():
     with tab1:
         st.header("Input Data Preview")
         
-        if all_data_available:
-            col1, col2, col3 = st.columns(3)
+        if base_data_available:
+            col1, col2 = st.columns(2)
             
             with col1:
                 st.subheader("FTSE Index & Dividend Yield")
                 df_index = data_files['index']['data']
-                st.dataframe(df_index.head(10), use_container_width=True)
+                st.dataframe(df_index.head(10), width='stretch')
                 st.caption(f"Total rows: {len(df_index)}")
             
             with col2:
                 st.subheader("UK InterBank Rate")
                 df_interbank = data_files['interbank']['data']
-                st.dataframe(df_interbank.head(10), use_container_width=True)
+                st.dataframe(df_interbank.head(10), width='stretch')
                 st.caption(f"Total rows: {len(df_interbank)}")
+            
+            col3, col4 = st.columns(2)
             
             with col3:
                 st.subheader("UK CPI YoY")
                 df_cpi = data_files['cpi']['data']
-                st.dataframe(df_cpi.head(10), use_container_width=True)
+                st.dataframe(df_cpi.head(10), width='stretch')
                 st.caption(f"Total rows: {len(df_cpi)}")
+            
+            with col4:
+                st.subheader("UK Industrial Production YoY")
+                if ip_data_available:
+                    df_ip = data_files['ip']['data']
+                    st.dataframe(df_ip.head(10), width='stretch')
+                    st.caption(f"Total rows: {len(df_ip)}")
+                else:
+                    st.warning("IP data not available")
         else:
             st.warning("Please ensure all input data files are available.")
             st.info("""
@@ -236,45 +261,63 @@ def main():
             1. `SMM265_Index_DivYield_Monthly.xlsx` - FTSE Index and Dividend Yield data
             2. `SMM265_UK_InterBank_Rate_Monthly.xlsx` - UK InterBank Rate data
             3. `SMM265 - UKRPCJYR Index - UK CPI YoY - Monthly.xlsx` - UK CPI data
+            4. `SMM265 - UKIPIYOY Index - UK IP YoY - Monthly.xlsx` - UK Industrial Production data (for Option 3)
             
-            Place these files in the `webapp_data/input/` folder or ensure the original data path is accessible.
+            Place these files in the `Data/` folder.
             """)
     
     # Tab 2: Run Analysis
     with tab2:
         st.header("Run Analysis")
         
-        if all_data_available:
+        if base_data_available:
             # Analysis Type Selection
             st.subheader("📋 Select Analysis Type")
             
+            # Build options list based on available data
+            options_list = ["option1", "option2"]
+            if ip_data_available:
+                options_list.append("option3")
+            
+            def format_option(x):
+                if x == "option1":
+                    return "Option 1: Standard Analysis (Current DY + CPI)"
+                elif x == "option2":
+                    return "Option 2: 2-Predictor Lag Selection (DY + CPI with Lags)"
+                else:
+                    return "Option 3: 3-Predictor Lag Selection (DY + CPI + IP with Lags)"
+            
             analysis_option = st.radio(
                 "Choose the analysis method:",
-                options=["option1", "option2"],
-                format_func=lambda x: "Option 1: Standard Analysis (Current DY + CPI)" if x == "option1" else "Option 2: Lag Selection Analysis (Optimal DY + CPI Lags)",
-                horizontal=True,
-                help="Option 1 uses current dividend yield and CPI. Option 2 tests multiple lags and selects optimal ones."
+                options=options_list,
+                format_func=format_option,
+                horizontal=False,
+                help="Option 1 uses current values. Option 2 tests DY and CPI lags. Option 3 adds Industrial Production."
             )
             
             if analysis_option == "option1":
                 st.info("""
-                **Option 1 - Standard Analysis Steps:**
-                1. Merge input data (Index, InterBank Rate, CPI)
-                2. Compute 6-month returns and excess returns
-                3. Train model using **current** dividend yield and CPI
-                4. Generate predictions using rolling windows
-                5. Create visualizations and summary tables
+                **Option 1 - Standard Analysis (2 Predictors):**
+                - Model: Excess_Return = α + β₁×DY + β₂×CPI + ε
+                - Uses **current** dividend yield and CPI values
+                - 20 rolling window predictions (Oct 2015 - Apr 2025)
+                """)
+            elif analysis_option == "option2":
+                st.info("""
+                **Option 2 - Sequential Lag Selection (2 Predictors):**
+                - Model: Excess_Return = α + β₁×DY(lag) + β₂×CPI(lag) + ε
+                - **Step 1:** Test DY lags (0, 1, 2, 3) → Select best by |t-stat|
+                - **Step 2:** Given optimal DY lag, test CPI lags (0, 1, 2) → Select best by |t-stat|
+                - 20 rolling window predictions with optimal lags per iteration
                 """)
             else:
                 st.info("""
-                **Option 2 - Lag Selection Analysis Steps:**
-                1. Merge input data (Index, InterBank Rate, CPI)
-                2. Compute 6-month returns and excess returns
-                3. **For each prediction window:**
-                   - Test DY lags (0, 1, 2, 3 months) → Select best by |t-statistic|
-                   - Given optimal DY lag, test CPI lags (0, 1, 2 months) → Select best by |t-statistic|
-                4. Generate predictions using rolling windows with **optimal lags**
-                5. Create visualizations and summary tables with lag information
+                **Option 3 - Sequential Lag Selection (3 Predictors with IP):**
+                - Model: Excess_Return = α + β₁×DY(lag) + β₂×CPI(lag) + β₃×IP(lag) + ε
+                - **Step 1:** Test DY lags (0, 1, 2, 3) → Select best by |t-stat|
+                - **Step 2:** Given optimal DY lag, test CPI lags (0, 1, 2) → Select best by |t-stat|
+                - **Step 3:** Given optimal DY & CPI lags, test IP lags (0, 1, 2) → Select best by |t-stat|
+                - 20 rolling window predictions with optimal lags per iteration
                 """)
             
             st.divider()
@@ -286,7 +329,7 @@ def main():
             col1, col2 = st.columns([1, 3])
             
             with col1:
-                run_button = st.button("▶️ Run Analysis", type="primary", use_container_width=True)
+                run_button = st.button("▶️ Run Analysis", type="primary", width='stretch')
             
             if run_button:
                 with st.spinner("Running analysis..."):
@@ -302,12 +345,16 @@ def main():
                     output_capture = io.StringIO()
                     
                     try:
+                        # Get IP data if available and option3 selected
+                        ip_data = data_files['ip']['data'] if (ip_data_available and analysis_option == "option3") else None
+                        
                         # Run the analysis with selected option
                         results = run_analysis(
                             data_files['index']['data'],
                             data_files['interbank']['data'],
                             data_files['cpi']['data'],
                             analysis_type=analysis_option,
+                            ip_data=ip_data,
                             progress_callback=update_progress
                         )
                         
@@ -336,8 +383,10 @@ def main():
             
             # Show which analysis type was run
             analysis_type = results.get('analysis_type', 'option1')
-            if analysis_type == "option2":
-                st.info("📊 **Lag Selection Analysis Results** - Using optimal DY and CPI lags per iteration")
+            if analysis_type == "option3":
+                st.info("📊 **3-Predictor Lag Selection Results** - Using optimal DY, CPI, and IP lags per iteration")
+            elif analysis_type == "option2":
+                st.info("📊 **2-Predictor Lag Selection Results** - Using optimal DY and CPI lags per iteration")
             else:
                 st.info("📊 **Standard Analysis Results** - Using current dividend yield and CPI")
             
@@ -405,7 +454,7 @@ def main():
             # Rolling Predictions Data
             if results.get('rolling_predictions') is not None:
                 st.subheader("📋 Rolling Predictions Data")
-                st.dataframe(results['rolling_predictions'], use_container_width=True)
+                st.dataframe(results['rolling_predictions'], width='stretch')
                 
                 # Download button
                 csv = results['rolling_predictions'].to_csv(index=False)
@@ -427,20 +476,25 @@ def main():
         
         ### Model Specification
         
-        The model predicts excess stock returns using two predictors:
-        
+        **2-Predictor Model (Options 1 & 2):**
         ```
         Excess_Return = α + β₁ × Dividend_Yield + β₂ × CPI_Growth + ε
         ```
         
+        **3-Predictor Model (Option 3):**
+        ```
+        Excess_Return = α + β₁ × Dividend_Yield + β₂ × CPI_Growth + β₃ × IP_Growth + ε
+        ```
+        
         Where:
         - **Excess_Return** = FTSE All-Share 6-month return - InterBank 6-month return
-        - **Dividend_Yield** = Dividend yield of FTSE All-Share (current or lagged(0,1,2,3))
-        - **CPI_Growth** = UK Consumer Price Index year-over-year growth rate (current or lagged(0,1,2))
+        - **Dividend_Yield** = Dividend yield of FTSE All-Share (lags: 0, 1, 2, 3)
+        - **CPI_Growth** = UK Consumer Price Index YoY growth rate (lags: 0, 1, 2)
+        - **IP_Growth** = UK Industrial Production YoY growth rate (lags: 0, 1, 2)
         
         ---
         
-        ### Option 1: Standard Analysis
+        ### Option 1: Standard Analysis (2 Predictors)
         
         Uses **current** values of both predictors:
         - Dividend Yield: Current month
@@ -448,24 +502,39 @@ def main():
         
         ---
         
-        ### Option 2: Lag Selection Analysis
+        ### Option 2: Lag Selection Analysis (2 Predictors)
         
-        Implements **sequential lag selection** following Pesaran & Timmermann methodology:
+        Implements **sequential lag selection**:
         
         **Step 1 - Select Optimal DY Lag:**
         - Test lags: 0, 1, 2, 3 months
-        - Selection criterion: Highest absolute t-statistic for β₁
+        - Selection criterion: Highest |t-statistic| for β₁
         
         **Step 2 - Select Optimal CPI Lag:**
         - Given optimal DY lag from Step 1
         - Test lags: 0, 1, 2 months
-        - Selection criterion: Highest absolute t-statistic for β₂
+        - Selection criterion: Highest |t-statistic| for β₂
         
-        **Step 3 - Make Prediction:**
-        - Use final model with both optimal lags
+        ---
+        
+        ### Option 3: Lag Selection Analysis (3 Predictors with IP)
+        
+        Extends Option 2 with Industrial Production as a third predictor:
+        
+        **Step 1 - Select Optimal DY Lag:**
+        - Test lags: 0, 1, 2, 3 months → Select best by |t-stat| for β₁
+        
+        **Step 2 - Select Optimal CPI Lag:**
+        - Given optimal DY lag, test CPI lags: 0, 1, 2 months
+        - Selection criterion: Highest |t-statistic| for β₂
+        
+        **Step 3 - Select Optimal IP Lag:**
+        - Given optimal DY and CPI lags, test IP lags: 0, 1, 2 months
+        - Selection criterion: Highest |t-statistic| for β₃
+        
+        **Step 4 - Make Prediction:**
+        - Use final 3-predictor model with all optimal lags
         - Generate 6-month ahead forecast
-        
-        This process repeats for **each prediction window**, allowing optimal lags to vary over time.
         
         ---
         
@@ -475,6 +544,7 @@ def main():
         2. **Expanding Windows**: Each prediction uses all data from April 1997 to the current date
         3. **Re-estimation Frequency**: Every 6 months (April and October)
         4. **Prediction Horizon**: 6 months ahead
+        5. **Total Predictions**: 20 (Oct 2015 → Apr 2025)
         
         ### Investment Strategy
         
